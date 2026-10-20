@@ -7,14 +7,15 @@ from app.core.config import Settings, get_settings
 
 
 def test_default_settings() -> None:
-    """Verify default configuration values without external environment file."""
-    settings = Settings(_env_file=None)
-    assert settings.APP_NAME == "Document Processing Platform"
-    assert settings.APP_ENV == "development"
-    assert settings.DEBUG is False
-    assert settings.LOG_LEVEL == "INFO"
-    assert settings.API_PORT == 8000
-    assert "asyncpg" in settings.DATABASE_URL
+    """Verify default configuration values without external environment file or variables."""
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(_env_file=None)
+        assert settings.APP_NAME == "Document Processing Platform"
+        assert settings.APP_ENV == "development"
+        assert settings.DEBUG is False
+        assert settings.LOG_LEVEL == "INFO"
+        assert settings.API_PORT == 8000
+        assert "asyncpg" in settings.DATABASE_URL
 
 
 def test_environment_override() -> None:

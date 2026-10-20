@@ -56,10 +56,6 @@ jobs:
           --health-retries 5
 
     env:
-      APP_NAME: "Document Processing Platform (Test)"
-      APP_ENV: testing
-      DEBUG: "false"
-      LOG_LEVEL: INFO
       DATABASE_URL: "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/docplatform_test"
 
     steps:
