@@ -3,6 +3,8 @@ services:
     image: postgres:16-alpine
     container_name: docplatform_postgres
     restart: unless-stopped
+    # WARNING: Default credentials are strictly for local development convenience.
+    # In production/staging, supply strong credentials via environment or secrets manager.
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}

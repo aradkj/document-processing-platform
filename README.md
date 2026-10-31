@@ -4,20 +4,22 @@ A modern, high-performance, and secure Document Processing Platform backend.
 
 ## Current Phase
 
-**Phase 1 — Foundation & Architecture**
+**Phase 1.5 — Foundation Audit, Hardening & Phase 2 Readiness**
 
-This phase establishes the production-oriented backend foundation:
-- Modular FastAPI application architecture
-- Environment-based configuration with Pydantic Settings
-- PostgreSQL database access using async SQLAlchemy 2.x and asyncpg
-- Database schema migration workflow using Alembic
-- Lightweight structured JSON logging with secret sanitization
-- Liveness (`/health`) and Readiness (`/ready`) health checks
-- Containerization with Docker and Docker Compose
+This phase audits, hardens, and prepares the backend foundation for Phase 2 (Authentication & Users):
+- Modular FastAPI application architecture with global sanitized exception handling
+- Strict Pydantic Settings configuration management with environment-based validation and production protections
+- PostgreSQL async database access with SQLAlchemy 2.x and asyncpg
+- Robust database connection pooling (`pool_size`, `max_overflow`, `pool_timeout`, `pool_pre_ping`)
+- Explicit transaction boundary architecture for predictable state mutations and safe error handling
+- Database schema migration workflow with Alembic
+- Secret-safe structured JSON logging with automatic redaction of credentials, Bearer tokens, and sensitive query parameters
+- Liveness (`/health`) and timeout-shielded Readiness (`/ready`) health checks
+- Containerization with Docker and Docker Compose running under a non-root user (`appuser`)
 - Quality gates with Pytest, Ruff, and Mypy
 - Automated CI pipeline with GitHub Actions
 
-Business domain features (users, documents, OCR, search, workers) are deferred to subsequent phases.
+Business domain features (users, authentication, documents, OCR, search, workers) are deferred to subsequent phases.
 
 ---
 
@@ -51,7 +53,7 @@ Business domain features (users, documents, OCR, search, workers) are deferred t
 │   └── script.py.mako         # Migration script template
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                # FastAPI application entrypoint & lifespan
+│   ├── main.py                # FastAPI application entrypoint, lifespan & error handlers
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── health.py          # Liveness (/health) & Readiness (/ready)
@@ -59,17 +61,17 @@ Business domain features (users, documents, OCR, search, workers) are deferred t
 │   │       └── __init__.py
 │   ├── core/
 │   │   ├── __init__.py
-│   │   ├── config.py          # Pydantic Settings configuration
+│   │   ├── config.py          # Pydantic Settings configuration & validation
 │   │   └── logging.py         # Structured JSON logging & secret redaction
 │   └── db/
 │       ├── __init__.py
-│       ├── base.py            # SQLAlchemy DeclarativeBase
-│       └── session.py         # Async engine & session lifecycle
+│       ├── base.py            # SQLAlchemy DeclarativeBase & naming conventions
+│       └── session.py         # Async engine, connection pool & session lifecycle
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py            # Test fixtures & database isolation
-│   ├── unit/                  # Unit tests (config, health, logging)
-│   └── integration/           # Integration tests (database, readiness)
+│   ├── unit/                  # Unit tests (config, health, logging, main)
+│   └── integration/           # Integration tests (database, readiness, migrations)
 ├── .env.example               # Example environment configuration
 ├── .gitignore                 # Git ignore rules protecting secrets
 ├── alembic.ini                # Alembic CLI configuration
@@ -153,6 +155,7 @@ alembic upgrade head
 ```bash
 alembic current
 alembic heads
+alembic history
 ```
 
 ### Running Migrations via Docker Compose
@@ -172,11 +175,11 @@ docker compose up -d api
 
 ## Health & Readiness Endpoints
 
-The application provides two health endpoints:
+The application provides two operational health endpoints:
 
 ### 1. Liveness Check: `GET /health`
 
-Determines if the FastAPI application process is alive and responsive. Does not check database connectivity.
+Determines if the FastAPI application process is alive and responsive. Does not query external dependencies.
 
 **Response (200 OK):**
 ```json
@@ -189,7 +192,7 @@ Determines if the FastAPI application process is alive and responsive. Does not 
 
 ### 2. Readiness Check: `GET /ready`
 
-Verifies that the application can communicate with its required PostgreSQL database dependency. Executes a lightweight `SELECT 1` query.
+Verifies that the application can communicate with its required PostgreSQL database dependency. Executes a lightweight `SELECT 1` query shielded with a 3.0-second timeout.
 
 **Success Response (200 OK):**
 ```json
@@ -206,7 +209,16 @@ Verifies that the application can communicate with its required PostgreSQL datab
   "database": "disconnected"
 }
 ```
-*Note: Connection errors and internal database traces are safely redacted and never leaked to the client.*
+*Note: Connection errors, timeouts, and internal database traces are safely redacted and never leaked to the client.*
+
+---
+
+## Architecture & Transaction Strategy
+
+### Transaction Boundaries (Phase 1.5 Hardening)
+- **Explicit Transactions:** State mutations (such as user creation or document registration in Phase 2) must explicitly execute `await session.commit()`.
+- **Accidental Commit Prevention:** If a route handler returns a non-200 HTTP response (such as a 400 validation error) without raising an exception, uncommitted changes are safely rolled back rather than silently committed.
+- **Guaranteed Cleanup:** `get_db_session()` automatically rolls back on exceptions and guarantees session closure in all scenarios.
 
 ---
 
@@ -217,7 +229,7 @@ Verifies that the application can communicate with its required PostgreSQL datab
 Run the full test suite with Pytest:
 
 ```bash
-pytest
+pytest -v
 ```
 
 Run unit tests only:
@@ -240,6 +252,12 @@ Run Ruff to verify code style and detect common bugs:
 ruff check .
 ```
 
+To verify code formatting:
+
+```bash
+ruff format --check .
+```
+
 To automatically format or fix issues:
 
 ```bash
@@ -257,9 +275,11 @@ mypy app tests
 
 ---
 
-## Security Considerations (Phase 1 Baseline)
+## Security Considerations
 
 - **Secret Handling:** Credentials and secrets are never hardcoded and are loaded strictly from environment variables.
-- **Redaction in Logs:** Custom structured JSON logging sanitizes database passwords, authorization tokens, and API keys.
-- **Error Shielding:** Internal database errors and stack traces are caught and safely reported to clients without exposing connection strings or system paths.
-- **Principle of Least Privilege:** CI workflows run with minimal required read permissions (`contents: read`).
+- **Production Guardrails:** `Settings` strictly prohibits `DEBUG=True` and default development database URLs when `APP_ENV=production`.
+- **Redaction in Logs:** Custom structured JSON logging sanitizes database passwords, Authorization Bearer tokens, URL query parameters, and sensitive dictionary keys.
+- **Error Shielding:** A global exception handler catches unhandled errors and returns standardized JSON (`500 Internal server error`) without leaking stack traces or internal paths.
+- **Least Privilege Container:** The Docker image runs as a non-privileged `appuser` (UID 1000).
+- **Least Privilege CI:** CI workflows run with minimal required read permissions (`contents: read`).

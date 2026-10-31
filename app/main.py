@@ -4,7 +4,8 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
 
 from app.api.health import router as health_router
 from app.api.v1 import api_v1_router
@@ -49,6 +50,19 @@ def create_application() -> FastAPI:
         openapi_url="/openapi.json" if not settings.is_production else None,
         lifespan=lifespan,
     )
+
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        """Catch all unhandled exceptions to prevent stack trace leakage to API clients."""
+        logger.exception(
+            "Unhandled server error processing request: %s %s",
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal server error"},
+        )
 
     # Health and operational endpoints
     app.include_router(health_router)

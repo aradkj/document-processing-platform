@@ -3,8 +3,10 @@
 from functools import lru_cache
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_DEV_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/docplatform"
 
 
 class Settings(BaseSettings):
@@ -41,18 +43,60 @@ class Settings(BaseSettings):
     )
     API_PORT: int = Field(
         default=8000,
+        ge=1,
+        le=65535,
         description="Bind port for the API server",
     )
 
     # Database Configuration (PostgreSQL with asyncpg)
     DATABASE_URL: str = Field(
-        default="postgresql+asyncpg://postgres:postgres@localhost:5432/docplatform",
+        default=DEFAULT_DEV_DATABASE_URL,
         description="Async PostgreSQL connection string",
+    )
+    DB_POOL_SIZE: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Database connection pool size",
+    )
+    DB_MAX_OVERFLOW: int = Field(
+        default=20,
+        ge=0,
+        le=100,
+        description="Maximum overflow connections beyond pool size",
+    )
+    DB_POOL_TIMEOUT: float = Field(
+        default=30.0,
+        ge=1.0,
+        description="Database connection acquisition timeout in seconds",
     )
 
     def __init__(self, _env_file: str | None = ".env", **values: Any) -> None:
         """Initialize settings with optional env_file override."""
         super().__init__(_env_file=_env_file, **values)
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def validate_database_url_scheme(cls, v: str) -> str:
+        """Ensure the database connection URL specifies the asyncpg dialect."""
+        if not v.startswith("postgresql+asyncpg://"):
+            raise ValueError(
+                "DATABASE_URL must use 'postgresql+asyncpg://' driver scheme for async access."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def validate_production_configuration(self) -> "Settings":
+        """Enforce strict security constraints for production environments."""
+        if self.APP_ENV == "production":
+            if self.DEBUG:
+                raise ValueError("DEBUG must be False in production environment.")
+            if self.DATABASE_URL == DEFAULT_DEV_DATABASE_URL:
+                raise ValueError(
+                    "Default development DATABASE_URL must not be used in production. "
+                    "Provide a secure production database connection string."
+                )
+        return self
 
     @property
     def is_production(self) -> bool:
@@ -69,3 +113,8 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return cached application settings instance."""
     return Settings()
+
+
+def clear_settings_cache() -> None:
+    """Clear the cached settings instance (useful during testing)."""
+    get_settings.cache_clear()

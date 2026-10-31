@@ -8,11 +8,18 @@ from typing import Any
 
 # Sensitive pattern regexes to redact from messages and extra parameters
 SENSITIVE_PATTERNS = [
+    re.compile(r"://([^:]+):([^@]+)@", re.IGNORECASE),  # DB connection strings with user:password
     re.compile(
-        r"(password|passwd|secret|token|api_?key|authorization)[\"']?\s*[:=]\s*[\"']?([^\"'\s,]+)",
+        r"Bearer\s+[A-Za-z0-9\-_.~+/]+=*", re.IGNORECASE
+    ),  # HTTP Authorization Bearer tokens
+    re.compile(
+        r"(password|passwd|secret|token|api_?key|access_token|refresh_token)[\"']?\s*[:=]\s*[\"']?([^\"'\s,&]+)",
         re.IGNORECASE,
     ),
-    re.compile(r"://([^:]+):([^@]+)@", re.IGNORECASE),  # DB connection strings with user:password
+    re.compile(
+        r"authorization[\"']?\s*[:=]\s*[\"']?(?!Bearer\s*\*\*\*)([^\"'\s,]+)",
+        re.IGNORECASE,
+    ),
 ]
 
 SENSITIVE_KEYS = {
@@ -26,18 +33,33 @@ SENSITIVE_KEYS = {
     "authorization",
     "credentials",
     "db_password",
+    "client_secret",
+    "private_key",
+    "jwt",
+    "auth",
 }
 
 
 def sanitize_text(text: str) -> str:
     """Sanitize sensitive patterns from free-form text strings."""
     sanitized = text
-    # Mask database connection passwords
+    # 1. Mask database connection passwords
     sanitized = re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", sanitized)
-    # Mask key-value patterns
+    # 2. Mask HTTP Authorization Bearer tokens
     sanitized = re.sub(
-        r"(password|passwd|secret|token|api_?key|authorization)[\"']?\s*[:=]\s*[\"']?([^\"'\s,]+)",
+        r"Bearer\s+[A-Za-z0-9\-_.~+/]+=*", r"Bearer ***", sanitized, flags=re.IGNORECASE
+    )
+    # 3. Mask key-value patterns (stopping at delimiters including & for query strings)
+    sanitized = re.sub(
+        r"(password|passwd|secret|token|api_?key|access_token|refresh_token)[\"']?\s*[:=]\s*[\"']?([^\"'\s,&]+)",
         r"\1=***",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    # 4. Mask non-Bearer authorization headers
+    sanitized = re.sub(
+        r"authorization[\"']?\s*[:=]\s*[\"']?(?!Bearer\s*\*\*\*)([^\"'\s,]+)",
+        r"authorization=***",
         sanitized,
         flags=re.IGNORECASE,
     )
@@ -45,7 +67,7 @@ def sanitize_text(text: str) -> str:
 
 
 def sanitize_data(data: Any) -> Any:
-    """Recursively sanitize dictionaries and lists to prevent secret leakage."""
+    """Recursively sanitize dictionaries, lists, sets, and strings to prevent secret leakage."""
     if isinstance(data, dict):
         sanitized_dict: dict[str, Any] = {}
         for key, value in data.items():
@@ -54,7 +76,7 @@ def sanitize_data(data: Any) -> Any:
             else:
                 sanitized_dict[key] = sanitize_data(value)
         return sanitized_dict
-    elif isinstance(data, list):
+    elif isinstance(data, (list, tuple, set)):
         return [sanitize_data(item) for item in data]
     elif isinstance(data, str):
         return sanitize_text(data)
@@ -62,7 +84,7 @@ def sanitize_data(data: Any) -> Any:
 
 
 class StructuredJsonFormatter(logging.Formatter):
-    """Format logs as structured JSON with security redactions."""
+    """Format logs as structured JSON with security redactions and safe serialization."""
 
     def format(self, record: logging.LogRecord) -> str:
         """Format the log record as a JSON object."""
@@ -109,7 +131,7 @@ class StructuredJsonFormatter(logging.Formatter):
             }:
                 log_data[key] = sanitize_data(value)
 
-        return json.dumps(log_data)
+        return json.dumps(log_data, default=str)
 
 
 def setup_logging(log_level: str = "INFO") -> None:

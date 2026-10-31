@@ -46,8 +46,50 @@ async def test_readiness_check_success_mock(async_client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_readiness_check_unexpected_scalar_returns_503(async_client: AsyncClient) -> None:
+    """Verify that /ready returns HTTP 503 when query returns unexpected value."""
+    mock_session = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalar.return_value = 0
+    mock_session.execute.return_value = mock_result
+
+    async def override_get_db_session() -> AsyncGenerator[AsyncMock, None]:
+        yield mock_session
+
+    app.dependency_overrides[get_db_session] = override_get_db_session
+    try:
+        response = await async_client.get("/ready")
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        data = response.json()
+        assert data["status"] == "unhealthy"
+        assert data["database"] == "unexpected_result"
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
+
+
+@pytest.mark.asyncio
+async def test_readiness_check_timeout_returns_503(async_client: AsyncClient) -> None:
+    """Verify that /ready returns HTTP 503 when database query times out."""
+    mock_session = AsyncMock()
+    mock_session.execute.side_effect = TimeoutError("Query timed out")
+
+    async def override_get_db_session() -> AsyncGenerator[AsyncMock, None]:
+        yield mock_session
+
+    app.dependency_overrides[get_db_session] = override_get_db_session
+    try:
+        response = await async_client.get("/ready")
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        data = response.json()
+        assert data["status"] == "unhealthy"
+        assert data["database"] == "timeout"
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
+
+
+@pytest.mark.asyncio
 async def test_readiness_check_failure_returns_503(async_client: AsyncClient) -> None:
-    """Verify that /ready returns HTTP 503 when database is unavailable."""
+    """Verify that /ready returns HTTP 503 when database connection is refused."""
     mock_session = AsyncMock()
     mock_session.execute.side_effect = ConnectionRefusedError("Database connection failed")
 

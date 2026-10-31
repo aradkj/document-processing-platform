@@ -1,5 +1,6 @@
 """Health and readiness check endpoints."""
 
+import asyncio
 import logging
 from typing import Annotated
 
@@ -14,6 +15,9 @@ from app.db.session import get_db_session
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Health"])
+
+# Default timeout in seconds for readiness check database query
+READINESS_TIMEOUT_SECONDS = 3.0
 
 
 @router.get(
@@ -40,9 +44,13 @@ async def health_check() -> dict[str, str]:
 async def readiness_check(
     session: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> JSONResponse:
-    """Verify application readiness by executing a lightweight database query."""
+    """Verify application readiness by executing a lightweight database query with timeout."""
     try:
-        result = await session.execute(text("SELECT 1"))
+        # Prevent readiness probe from hanging if database connection stalls
+        result = await asyncio.wait_for(
+            session.execute(text("SELECT 1")),
+            timeout=READINESS_TIMEOUT_SECONDS,
+        )
         scalar = result.scalar()
         if scalar == 1:
             return JSONResponse(
@@ -61,6 +69,15 @@ async def readiness_check(
                     "database": "unexpected_result",
                 },
             )
+    except TimeoutError:
+        logger.error("Readiness check timed out waiting for database query.")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "unhealthy",
+                "database": "timeout",
+            },
+        )
     except Exception as exc:
         # Redact and log error safely without leaking database credentials or traces to client
         logger.error("Readiness check failed to connect to database: %s", type(exc).__name__)
