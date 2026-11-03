@@ -140,6 +140,91 @@ docker compose down
 
 ---
 
+## Local Email Verification & Testing (Mailpit)
+
+For local development and testing without paid email providers or external internet connectivity, the project includes [Mailpit](https://github.com/axllent/mailpit).
+
+### 1. Start Mailpit
+
+```bash
+docker compose up -d mailpit
+```
+
+Mailpit exposes:
+- **SMTP Server:** `localhost:1025` (receives outgoing emails from FastAPI)
+- **Web UI:** `http://localhost:8025` (browser inbox for previewing verification emails)
+
+### 2. Local Environment Configuration (`.env`)
+
+```env
+SMTP_HOST=localhost
+SMTP_PORT=1025
+SMTP_USE_TLS=false
+SMTP_USE_SSL=false
+SMTP_FROM_EMAIL=noreply@docplatform.local
+SMTP_FROM_NAME="Document Processing Platform"
+FRONTEND_BASE_URL=http://localhost:3000
+EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES=30
+```
+
+### 3. End-to-End Verification Walkthrough
+
+1. **Register a test account:**
+   ```bash
+   curl -X POST http://localhost:8000/api/v1/auth/register \
+     -H "Content-Type: application/json" \
+     -d '{"email": "alice@example.com", "username": "alice", "password": "SuperSecretPassword123!"}'
+   ```
+2. **Inspect the verification email:**
+   Open `http://localhost:8025` in your browser. Click on the latest message sent to `alice@example.com`.
+3. **Extract verification token:**
+   The verification link uses a URI fragment to prevent token leakage in server access logs:
+   `http://localhost:3000/verify-email#token=<RAW_VERIFICATION_TOKEN>`
+4. **Consume verification token:**
+   ```bash
+   curl -X POST http://localhost:8000/api/v1/auth/verify-email \
+     -H "Content-Type: application/json" \
+     -d '{"token": "<RAW_VERIFICATION_TOKEN>"}'
+   ```
+   *Response (200 OK):*
+   ```json
+   {
+     "message": "Email verified successfully",
+     "email": "alice@example.com",
+     "is_verified": true
+   }
+   ```
+5. **Verify account status:**
+   Log in and inspect `GET /api/v1/auth/me` to confirm `"is_verified": true`.
+6. **Request a new verification email (Resend):**
+   ```bash
+   curl -X POST http://localhost:8000/api/v1/auth/resend-verification \
+     -H "Authorization: Bearer <ACCESS_TOKEN>"
+   ```
+
+### 4. Frontend Integration Contract
+
+Verification tokens are delivered in the URL fragment (`#token=<raw_token>`):
+- **Why URL Fragment:** The fragment is never transmitted in HTTP requests to the web server, CDN, or reverse proxy, preventing raw tokens from leaking into access logs or `Referer` headers.
+- **Frontend Flow:**
+  1. The client router reads the token from `window.location.hash`.
+  2. The client immediately removes the token from the browser address bar (`history.replaceState(null, "", window.location.pathname)`).
+  3. The client submits the token in the request body to `POST /api/v1/auth/verify-email`.
+
+### 5. Production SMTP Configuration
+
+In production (`APP_ENV=production`), development defaults (`localhost`, port `1025`, `localhost` frontend URLs) are strictly rejected at startup. Required production environment variables:
+- `SMTP_HOST`: Fully qualified domain name or IP of production SMTP relay (e.g., `smtp.company.com`).
+- `SMTP_PORT`: Port number (e.g., `587` for STARTTLS, `465` for SSL).
+- `SMTP_USE_TLS`: Set `true` if using STARTTLS (port 587).
+- `SMTP_USE_SSL`: Set `true` if using implicit SSL (port 465). Note: TLS and SSL are mutually exclusive.
+- `SMTP_USERNAME` & `SMTP_PASSWORD`: Optional credentials (required together if SMTP authentication is enabled; omitted if using an authenticated internal network relay).
+- `SMTP_FROM_EMAIL`: Verified production sender address (e.g., `noreply@platform.example.com`).
+- `FRONTEND_BASE_URL`: Public production frontend URL (e.g., `https://app.example.com`).
+
+
+---
+
 ## Database Migrations (Alembic)
 
 Database migrations use Alembic with the async SQLAlchemy engine.

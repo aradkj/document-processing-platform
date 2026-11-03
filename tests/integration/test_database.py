@@ -117,7 +117,7 @@ async def test_alembic_single_head_and_history() -> None:
     script = ScriptDirectory.from_config(alembic_cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0004_user_ci_indexes"
+    assert heads[0] == "0008_optimize_email_token_idx"
 
 
 @pytest.mark.asyncio

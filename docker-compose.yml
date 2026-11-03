@@ -37,6 +37,8 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-docplatform}
       API_HOST: 0.0.0.0
       API_PORT: 8000
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:
@@ -45,6 +47,14 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: docplatform_mailpit
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${MAILPIT_UI_PORT:-8025}:8025"
 
 volumes:
   postgres_data:

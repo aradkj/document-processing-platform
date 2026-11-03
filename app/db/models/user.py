@@ -10,6 +10,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.db.models.email_verification_token import EmailVerificationToken
+    from app.db.models.refresh_token import RefreshToken
     from app.db.models.role import Role
 
 
@@ -77,6 +79,18 @@ class User(Base):
         "Role",
         secondary="user_roles",
         back_populates="users",
+        lazy="raise",
+    )
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+        "RefreshToken",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="raise",
+    )
+    email_verification_tokens: Mapped[list["EmailVerificationToken"]] = relationship(
+        "EmailVerificationToken",
+        back_populates="user",
+        cascade="all, delete-orphan",
         lazy="raise",
     )
 

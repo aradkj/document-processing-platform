@@ -23,6 +23,7 @@ def test_default_settings() -> None:
         assert settings.DB_POOL_SIZE == 10
         assert settings.DB_MAX_OVERFLOW == 20
         assert settings.DB_POOL_TIMEOUT == 30.0
+        assert settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS == 7
 
 
 def test_environment_override() -> None:
@@ -37,6 +38,7 @@ def test_environment_override() -> None:
         "DB_POOL_SIZE": "15",
         "DB_MAX_OVERFLOW": "25",
         "DB_POOL_TIMEOUT": "45.0",
+        "JWT_REFRESH_TOKEN_EXPIRE_DAYS": "14",
     }
     with patch.dict(os.environ, test_env, clear=True):
         custom_settings = Settings(_env_file=None)
@@ -49,6 +51,7 @@ def test_environment_override() -> None:
         assert custom_settings.DB_POOL_SIZE == 15
         assert custom_settings.DB_MAX_OVERFLOW == 25
         assert custom_settings.DB_POOL_TIMEOUT == 45.0
+        assert custom_settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS == 14
         assert custom_settings.is_production is False
         assert custom_settings.is_testing is False
 
@@ -106,12 +109,67 @@ def test_valid_production_configuration() -> None:
         "APP_ENV": "production",
         "DEBUG": "false",
         "DATABASE_URL": "postgresql+asyncpg://prod_user:super_secret_pw@db.internal:5432/prod_db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "smtp.internal.example.com",
+        "SMTP_PORT": "587",
+        "SMTP_USE_TLS": "true",
+        "SMTP_FROM_EMAIL": "noreply@platform.example.com",
+        "FRONTEND_BASE_URL": "https://app.example.com",
     }
     with patch.dict(os.environ, prod_env, clear=True):
         prod_settings = Settings(_env_file=None)
         assert prod_settings.is_production is True
         assert prod_settings.is_testing is False
-        assert prod_settings.DEBUG is False
+        expected_secret = "a_very_secure_and_long_production_jwt_secret_key_32_chars_min"
+        assert prod_settings.JWT_SECRET_KEY == expected_secret
+        assert prod_settings.SMTP_HOST == "smtp.internal.example.com"
+        assert prod_settings.SMTP_USE_TLS is True
+
+
+def test_production_mode_disallows_default_jwt_secret() -> None:
+    """Verify that default JWT secret is rejected in production."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "Default development JWT_SECRET_KEY must not be used in production" in str(
+            exc_info.value
+        )
+
+
+def test_production_mode_disallows_short_jwt_secret() -> None:
+    """Verify that JWT secret shorter than 32 characters is rejected in production."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "short_secret_under_32",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "JWT_SECRET_KEY must be at least 32 characters long in production" in str(
+            exc_info.value
+        )
+
+
+def test_production_mode_disallows_insecure_jwt_algorithm() -> None:
+    """Verify that insecure JWT algorithm (e.g. none) is rejected in production."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "JWT_ALGORITHM": "none",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "JWT_ALGORITHM must be a secure HMAC algorithm" in str(exc_info.value)
 
 
 def test_testing_environment_property() -> None:
@@ -131,3 +189,90 @@ def test_get_settings_cached_and_clear_cache() -> None:
     clear_settings_cache()
     s3 = get_settings()
     assert s3 is not None
+
+
+def test_invalid_refresh_token_expire_days_rejected() -> None:
+    """Verify that JWT_REFRESH_TOKEN_EXPIRE_DAYS < 1 is rejected by validation."""
+    with patch.dict(os.environ, {"JWT_REFRESH_TOKEN_EXPIRE_DAYS": "0"}, clear=True):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
+
+
+def test_smtp_tls_and_ssl_mutually_exclusive() -> None:
+    """Verify that enabling both SMTP_USE_TLS and SMTP_USE_SSL raises ValidationError."""
+    env = {
+        "SMTP_USE_TLS": "true",
+        "SMTP_USE_SSL": "true",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "mutually exclusive" in str(exc_info.value)
+
+
+def test_smtp_partial_credentials_rejected() -> None:
+    """Verify that specifying only username without password (or vice versa) is rejected."""
+    with patch.dict(os.environ, {"SMTP_USERNAME": "my_user"}, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "SMTP_USERNAME and SMTP_PASSWORD must both be provided" in str(exc_info.value)
+
+    with patch.dict(os.environ, {"SMTP_PASSWORD": "my_password"}, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "SMTP_USERNAME and SMTP_PASSWORD must both be provided" in str(exc_info.value)
+
+
+def test_production_mode_rejects_localhost_smtp() -> None:
+    """Verify that production rejects localhost or port 1025 development SMTP settings."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "localhost",
+        "SMTP_PORT": "1025",
+        "FRONTEND_BASE_URL": "https://app.example.com",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "Development SMTP settings" in str(exc_info.value)
+
+
+def test_production_mode_rejects_localhost_frontend_url() -> None:
+    """Verify that production rejects localhost frontend base URL."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "smtp.company.com",
+        "SMTP_PORT": "587",
+        "SMTP_USE_TLS": "true",
+        "FRONTEND_BASE_URL": "http://localhost:3000",
+        "SMTP_FROM_EMAIL": "noreply@company.com",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "FRONTEND_BASE_URL must not point to localhost" in str(exc_info.value)
+
+
+def test_production_mode_rejects_local_from_email() -> None:
+    """Verify that production rejects .local from_email domains."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "smtp.company.com",
+        "SMTP_PORT": "587",
+        "SMTP_USE_TLS": "true",
+        "FRONTEND_BASE_URL": "https://app.company.com",
+        "SMTP_FROM_EMAIL": "noreply@docplatform.local",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "SMTP_FROM_EMAIL must be configured with a valid domain" in str(exc_info.value)

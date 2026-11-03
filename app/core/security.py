@@ -1,8 +1,13 @@
-"""Password hashing, verification, and security policies using Argon2id."""
+"""Password hashing, verification, security policies, and JWT token management."""
 
+import hashlib
+import secrets
 import unicodedata
-from typing import Final
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final
 
+import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import (
     HashingError,
@@ -10,6 +15,8 @@ from argon2.exceptions import (
     VerificationError,
     VerifyMismatchError,
 )
+
+from app.core.config import get_settings
 
 MIN_PASSWORD_LENGTH: Final[int] = 8
 MAX_PASSWORD_LENGTH: Final[int] = 128
@@ -25,9 +32,30 @@ _hasher = PasswordHasher(
     salt_len=16,
 )
 
+# Pre-computed dummy Argon2id hash for user enumeration mitigation
+_DUMMY_PASSWORD_HASH: Final[str] = _hasher.hash("dummy_mitigate_enumeration_timing")
+
 
 class PasswordPolicyError(ValueError):
     """Raised when a candidate password fails to satisfy security policy criteria."""
+
+    pass
+
+
+class TokenSecurityError(ValueError):
+    """Base exception for token security and verification failures."""
+
+    pass
+
+
+class TokenExpiredError(TokenSecurityError):
+    """Raised when a token has expired."""
+
+    pass
+
+
+class TokenInvalidError(TokenSecurityError):
+    """Raised when a token signature, algorithm, claims, or format is invalid."""
 
     pass
 
@@ -100,3 +128,228 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def verify_dummy_password(plain_password: str) -> None:
+    """Perform a constant-time dummy password verification to mitigate timing attacks."""
+    verify_password(plain_password, _DUMMY_PASSWORD_HASH)
+
+
+def create_access_token(
+    subject: str | uuid.UUID,
+    expires_delta: timedelta | None = None,
+    extra_claims: dict[str, Any] | None = None,
+) -> str:
+    """Create a cryptographically signed JWT access token.
+
+    Claims:
+    - sub: stable identifier (user UUID string)
+    - iat: issued at UTC timestamp
+    - exp: expiration UTC timestamp
+    - jti: unique token UUIDv4 hex
+    - iss: configured issuer
+    - aud: configured audience
+    - type: 'access'
+    """
+    settings = get_settings()
+    now = datetime.now(UTC)
+    if expires_delta is not None:
+        expire = now + expires_delta
+    else:
+        expire = now + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    payload: dict[str, Any] = {
+        "sub": str(subject),
+        "iat": int(now.timestamp()),
+        "exp": int(expire.timestamp()),
+        "jti": uuid.uuid4().hex,
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
+        "type": "access",
+    }
+
+    if extra_claims:
+        for key, value in extra_claims.items():
+            if key not in {"sub", "iat", "exp", "type"}:
+                payload[key] = value
+
+    return jwt.encode(
+        payload,
+        settings.JWT_SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+def decode_access_token(token: str) -> dict[str, Any]:
+    """Decode and verify a JWT access token with algorithm pinning and claim validation.
+
+    Enforces:
+    - Strict algorithm pinning (only settings.JWT_ALGORITHM)
+    - Expiration check
+    - Issuer and audience validation
+    - Required claims: exp, sub, iat, type
+    - type claim must equal 'access'
+    """
+    if not isinstance(token, str) or not token.strip():
+        raise TokenInvalidError("Token must be a non-empty string.")
+
+    settings = get_settings()
+    try:
+        payload = jwt.decode(
+            token.strip(),
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+            options={
+                "require": ["exp", "sub", "iat", "type"],
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_aud": True,
+                "verify_iss": True,
+            },
+        )
+    except jwt.ExpiredSignatureError as exc:
+        raise TokenExpiredError("Token has expired.") from exc
+    except (
+        jwt.InvalidSignatureError,
+        jwt.InvalidAlgorithmError,
+        jwt.DecodeError,
+        jwt.InvalidAudienceError,
+        jwt.InvalidIssuerError,
+        jwt.MissingRequiredClaimError,
+        jwt.InvalidTokenError,
+    ) as exc:
+        raise TokenInvalidError(f"Invalid token: {type(exc).__name__}") from exc
+
+    if payload.get("type") != "access":
+        raise TokenInvalidError("Invalid token type: expected access token.")
+
+    subject = payload.get("sub")
+    if not subject:
+        raise TokenInvalidError("Token missing valid subject claim.")
+    try:
+        uuid.UUID(str(subject))
+    except (ValueError, TypeError) as exc:
+        raise TokenInvalidError("Token subject is not a valid UUID.") from exc
+
+    return payload
+
+
+def create_refresh_token(
+    subject: str | uuid.UUID,
+    expires_delta: timedelta | None = None,
+    extra_claims: dict[str, Any] | None = None,
+    jti: str | None = None,
+) -> str:
+    """Create a long-lived, cryptographically signed JWT refresh token.
+
+    Claims:
+    - sub: stable identifier (user UUID string)
+    - iat: issued at UTC timestamp
+    - exp: expiration UTC timestamp
+    - jti: unique token UUIDv4 hex
+    - iss: configured issuer
+    - aud: configured audience
+    - type: 'refresh'
+    """
+    settings = get_settings()
+    now = datetime.now(UTC)
+    if expires_delta is not None:
+        expire = now + expires_delta
+    else:
+        expire = now + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+
+    token_jti = jti if jti is not None else uuid.uuid4().hex
+    payload: dict[str, Any] = {
+        "sub": str(subject),
+        "iat": int(now.timestamp()),
+        "exp": int(expire.timestamp()),
+        "jti": token_jti,
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
+        "type": "refresh",
+    }
+
+    if extra_claims:
+        for key, value in extra_claims.items():
+            if key not in {"sub", "iat", "exp", "type", "jti"}:
+                payload[key] = value
+
+    return jwt.encode(
+        payload,
+        settings.JWT_SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+def decode_refresh_token(token: str) -> dict[str, Any]:
+    """Decode and verify a JWT refresh token with algorithm pinning and claim validation.
+
+    Enforces:
+    - Strict algorithm pinning (only settings.JWT_ALGORITHM)
+    - Expiration check
+    - Issuer and audience validation
+    - Required claims: exp, sub, iat, type, jti
+    - type claim must equal 'refresh'
+    - sub must be a valid UUID
+    - jti must be a non-empty string
+    """
+    if not isinstance(token, str) or not token.strip():
+        raise TokenInvalidError("Token must be a non-empty string.")
+
+    settings = get_settings()
+    try:
+        payload = jwt.decode(
+            token.strip(),
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+            options={
+                "require": ["exp", "sub", "iat", "type", "jti"],
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_aud": True,
+                "verify_iss": True,
+            },
+        )
+    except jwt.ExpiredSignatureError as exc:
+        raise TokenExpiredError("Token has expired.") from exc
+    except (
+        jwt.InvalidSignatureError,
+        jwt.InvalidAlgorithmError,
+        jwt.DecodeError,
+        jwt.InvalidAudienceError,
+        jwt.InvalidIssuerError,
+        jwt.MissingRequiredClaimError,
+        jwt.InvalidTokenError,
+    ) as exc:
+        raise TokenInvalidError(f"Invalid token: {type(exc).__name__}") from exc
+
+    if payload.get("type") != "refresh":
+        raise TokenInvalidError("Invalid token type: expected refresh token.")
+
+    subject = payload.get("sub")
+    if not subject:
+        raise TokenInvalidError("Token missing valid subject claim.")
+    try:
+        uuid.UUID(str(subject))
+    except (ValueError, TypeError) as exc:
+        raise TokenInvalidError("Token subject is not a valid UUID.") from exc
+
+    jti = payload.get("jti")
+    if not jti or not isinstance(jti, str) or not jti.strip():
+        raise TokenInvalidError("Token missing valid jti claim.")
+
+    return payload
+
+
+def generate_email_verification_token() -> str:
+    """Generate a cryptographically secure, opaque random verification token (>=256 bits)."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_email_verification_token(raw_token: str) -> str:
+    """Hash raw verification token using SHA-256 for secure, irreversible database persistence."""
+    return hashlib.sha256(raw_token.strip().encode("utf-8")).hexdigest()
