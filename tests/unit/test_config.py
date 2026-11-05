@@ -250,7 +250,7 @@ def test_production_mode_rejects_localhost_frontend_url() -> None:
         "SMTP_HOST": "smtp.company.com",
         "SMTP_PORT": "587",
         "SMTP_USE_TLS": "true",
-        "FRONTEND_BASE_URL": "http://localhost:3000",
+        "FRONTEND_BASE_URL": "https://localhost:3000",
         "SMTP_FROM_EMAIL": "noreply@company.com",
     }
     with patch.dict(os.environ, prod_env, clear=True):
@@ -276,3 +276,118 @@ def test_production_mode_rejects_local_from_email() -> None:
         with pytest.raises(ValidationError) as exc_info:
             Settings(_env_file=None)
         assert "SMTP_FROM_EMAIL must be configured with a valid domain" in str(exc_info.value)
+
+
+def test_production_mode_rejects_http_frontend_url() -> None:
+    """Verify that non-HTTPS frontend URL is rejected in production."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "smtp.company.com",
+        "SMTP_PORT": "587",
+        "SMTP_USE_TLS": "true",
+        "FRONTEND_BASE_URL": "http://app.company.com",
+        "SMTP_FROM_EMAIL": "noreply@company.com",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "FRONTEND_BASE_URL must use HTTPS in production" in str(exc_info.value)
+
+
+def test_invalid_frontend_url_scheme_rejected() -> None:
+    """Verify that invalid frontend URL schemes (e.g. ftp://) are rejected."""
+    with patch.dict(os.environ, {"FRONTEND_BASE_URL": "ftp://app.company.com"}, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "starting with http:// or https://" in str(exc_info.value)
+
+
+def test_production_authenticated_smtp_without_encryption_rejected() -> None:
+    """Verify that specifying SMTP credentials without TLS or SSL is rejected in production."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "smtp.company.com",
+        "SMTP_PORT": "25",
+        "SMTP_USE_TLS": "false",
+        "SMTP_USE_SSL": "false",
+        "SMTP_USERNAME": "smtp_user",
+        "SMTP_PASSWORD": "smtp_password",
+        "FRONTEND_BASE_URL": "https://app.company.com",
+        "SMTP_FROM_EMAIL": "noreply@company.com",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "Authenticated SMTP must use TLS or SSL encryption in production" in str(
+            exc_info.value
+        )
+
+
+def test_production_authenticated_smtp_with_starttls_accepted() -> None:
+    """Verify that SMTP credentials with STARTTLS are accepted in production."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "smtp.company.com",
+        "SMTP_PORT": "587",
+        "SMTP_USE_TLS": "true",
+        "SMTP_USE_SSL": "false",
+        "SMTP_USERNAME": "smtp_user",
+        "SMTP_PASSWORD": "smtp_password",
+        "FRONTEND_BASE_URL": "https://app.company.com",
+        "SMTP_FROM_EMAIL": "noreply@company.com",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        s = Settings(_env_file=None)
+        assert s.SMTP_USE_TLS is True
+        assert s.SMTP_USERNAME == "smtp_user"
+
+
+def test_production_authenticated_smtp_with_ssl_accepted() -> None:
+    """Verify that SMTP credentials with SSL are accepted in production."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "smtp.company.com",
+        "SMTP_PORT": "465",
+        "SMTP_USE_TLS": "false",
+        "SMTP_USE_SSL": "true",
+        "SMTP_USERNAME": "smtp_user",
+        "SMTP_PASSWORD": "smtp_password",
+        "FRONTEND_BASE_URL": "https://app.company.com",
+        "SMTP_FROM_EMAIL": "noreply@company.com",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        s = Settings(_env_file=None)
+        assert s.SMTP_USE_SSL is True
+        assert s.SMTP_USERNAME == "smtp_user"
+
+
+def test_production_credential_less_smtp_accepted() -> None:
+    """Verify that unauthenticated internal relay without TLS is accepted in production."""
+    prod_env = {
+        "APP_ENV": "production",
+        "DEBUG": "false",
+        "DATABASE_URL": "postgresql+asyncpg://prod_user:pw@db.internal:5432/db",
+        "JWT_SECRET_KEY": "a_very_secure_and_long_production_jwt_secret_key_32_chars_min",
+        "SMTP_HOST": "relay.internal.company.com",
+        "SMTP_PORT": "25",
+        "SMTP_USE_TLS": "false",
+        "SMTP_USE_SSL": "false",
+        "FRONTEND_BASE_URL": "https://app.company.com",
+        "SMTP_FROM_EMAIL": "noreply@company.com",
+    }
+    with patch.dict(os.environ, prod_env, clear=True):
+        s = Settings(_env_file=None)
+        assert s.SMTP_HOST == "relay.internal.company.com"
+        assert s.SMTP_USERNAME is None

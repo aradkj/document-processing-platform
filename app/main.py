@@ -37,17 +37,61 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("Application shutdown complete.")
 
 
+OPENAPI_TAGS = [
+    {
+        "name": "Authentication",
+        "description": (
+            "User identity, session lifecycle, credential verification, and account recovery. "
+            "Includes registration, login, JWT access/refresh token rotation, logout, "
+            "email verification, profile management, and password reset."
+        ),
+    },
+    {
+        "name": "Health",
+        "description": "Operational health probes for service liveness and database readiness.",
+    },
+]
+
+API_DESCRIPTION = """
+## Document Processing Platform API
+
+A robust, production-conscious asynchronous backend service providing secure user identity,
+authentication, and session management.
+
+### Key Features (Phase 2):
+* **Argon2id Password Security:** Memory-hard password hashing and validation policy.
+* **Dual-Token JWT Architecture:** Short-lived access tokens (HS256) and persistent refresh tokens.
+* **Refresh Token Rotation & Reuse Detection:** Automatic revocation of token families on reuse.
+* **Instant Session Invalidation:** Global access token invalidation via persistent `auth_version`.
+* **Email Verification & Password Reset:** High-entropy single-use tokens with URL hash fragments.
+* **Anti-Enumeration Protection:** Uniform status codes and constant-time dummy hashing.
+* **Zero Secret Leakage:** Strict Pydantic response filtering preventing credential leaks.
+"""
+
+
 def create_application() -> FastAPI:
     """Create and configure the FastAPI application instance."""
     settings = get_settings()
 
     app = FastAPI(
         title=settings.APP_NAME,
-        description="Production-oriented backend for the Document Processing Platform",
-        version="0.1.0",
+        description=API_DESCRIPTION,
+        version="0.2.0",
         docs_url="/docs" if not settings.is_production else None,
         redoc_url="/redoc" if not settings.is_production else None,
         openapi_url="/openapi.json" if not settings.is_production else None,
+        openapi_tags=OPENAPI_TAGS,
+        contact={
+            "name": "Document Processing Platform Engineering",
+            "url": "https://github.com/aradkj/document-processing-platform",
+        },
+        license_info={
+            "name": "Proprietary",
+        },
+        swagger_ui_parameters={
+            "persistAuthorization": True,
+            "displayRequestDuration": True,
+        },
         lifespan=lifespan,
     )
 

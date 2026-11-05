@@ -191,6 +191,131 @@ class EmailService:
             )
             return False
 
+    def build_password_reset_url(self, raw_token: str) -> str:
+        """Construct public frontend password reset link with token in URI fragment.
+
+        Placing the token in the URI fragment (#token=...) ensures that browsers
+        never transmit the raw token in HTTP request lines to the frontend web server,
+        CDN, or reverse proxy, preventing token leakage into server access logs,
+        Referer headers to third-party assets, or external telemetry.
+        """
+        base_url = self.settings.FRONTEND_BASE_URL.rstrip("/")
+        return f"{base_url}/reset-password#token={raw_token}"
+
+    def create_password_reset_message(
+        self,
+        to_email: str,
+        reset_url: str,
+        expires_in_minutes: int,
+    ) -> MIMEMultipart:
+        """Assemble multipart MIME email with both HTML and plain-text representations."""
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"Reset your password - {self.settings.APP_NAME}"
+        msg["From"] = formataddr(
+            (
+                str(Header(self.settings.SMTP_FROM_NAME, "utf-8")),
+                self.settings.SMTP_FROM_EMAIL,
+            )
+        )
+        msg["To"] = to_email
+
+        plain_text = (
+            f"Hello,\n\n"
+            f"We received a request to reset your password for {self.settings.APP_NAME}.\n\n"
+            f"You can reset your password by visiting the link below:\n"
+            f"{reset_url}\n\n"
+            f"This link is single-use and will expire in {expires_in_minutes} minutes.\n\n"
+            f"If you did not request a password reset, you can safely ignore this email.\n\n"
+            f"Best regards,\n"
+            f"The {self.settings.APP_NAME} Team\n"
+        )
+
+        html_content = (
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<head><meta charset='utf-8'><title>Reset your password</title></head>\n"
+            "<body style='font-family: sans-serif; line-height: 1.6; color: #1f2937; margin: 0; "
+            "padding: 20px;'>\n"
+            "  <div style='max-width: 600px; margin: 0 auto; background: #ffffff; padding: 24px; "
+            "border: 1px solid #e5e7eb; border-radius: 8px;'>\n"
+            "    <h2 style='color: #111827; margin-top: 0;'>Password Reset Request</h2>\n"
+            "    <p>Hello,</p>\n"
+            f"    <p>We received a request to reset your password for "
+            f"<strong>{self.settings.APP_NAME}</strong>.</p>\n"
+            "    <p style='margin: 24px 0;'>\n"
+            f"      <a href='{reset_url}' style='background-color: #dc2626; color: #ffffff; "
+            "padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 600; "
+            "display: inline-block;'>\n"
+            "        Reset Password\n"
+            "      </a>\n"
+            "    </p>\n"
+            "    <p style='font-size: 0.9em; color: #4b5563;'>Or copy this link into browser:</p>\n"
+            f"    <p style='word-break: break-all; font-size: 0.85em; color: #2563eb;'>"
+            f"<a href='{reset_url}'>{reset_url}</a></p>\n"
+            f"    <p style='font-size: 0.85em; color: #6b7280;'>"
+            f"This link is single-use and will expire in {expires_in_minutes} minutes.</p>\n"
+            "    <hr style='border: none; border-top: 1px solid #e5e7eb; margin: 24px 0;' />\n"
+            "    <p style='font-size: 0.8em; color: #9ca3af; margin-bottom: 0;'>\n"
+            "      If you did not request a password reset, you can safely ignore this email.\n"
+            "    </p>\n"
+            "  </div>\n"
+            "</body>\n"
+            "</html>"
+        )
+
+        part_text = MIMEText(plain_text, "plain", "utf-8")
+        part_html = MIMEText(html_content, "html", "utf-8")
+
+        msg.attach(part_text)
+        msg.attach(part_html)
+        return msg
+
+    async def send_password_reset_email(
+        self,
+        to_email: str,
+        raw_token: str,
+        expires_in_minutes: int | None = None,
+    ) -> bool:
+        """Deliver a password reset message containing the single-use token link."""
+        expiry_minutes = (
+            expires_in_minutes
+            if expires_in_minutes is not None
+            else self.settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
+        )
+        reset_url = self.build_password_reset_url(raw_token)
+        msg = self.create_password_reset_message(
+            to_email=to_email,
+            reset_url=reset_url,
+            expires_in_minutes=expiry_minutes,
+        )
+
+        if self.use_mock_transport:
+            self.sent_messages.append(
+                {
+                    "to_email": to_email,
+                    "reset_url": reset_url,
+                    "verification_url": reset_url,
+                    "expires_in_minutes": expiry_minutes,
+                    "msg": msg,
+                    "type": "password_reset",
+                }
+            )
+            logger.info("Mock password reset email dispatched to recipient: %s", to_email)
+            return True
+
+        try:
+            await asyncio.to_thread(self._send_smtp_sync, msg, to_email)
+            logger.info("Password reset email successfully delivered to recipient: %s", to_email)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Failed to deliver password reset email to %s via SMTP (%s: %s).",
+                to_email,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+
 
 # Global default service instance
 _default_email_service: EmailService | None = None

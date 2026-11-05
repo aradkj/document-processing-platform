@@ -261,3 +261,80 @@ class ResendVerificationResponse(BaseModel):
     )
 
     model_config = ConfigDict(extra="forbid")
+
+
+class PasswordResetRequest(BaseModel):
+    """Payload submitted to request a password reset email."""
+
+    email: EmailStr = Field(
+        ...,
+        description="User email address for which to initiate password reset",
+        max_length=255,
+        examples=["user@example.com"],
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: Any) -> Any:
+        """Strip whitespace and convert email to lowercase for consistent identity lookup."""
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+
+class PasswordResetRequestResponse(BaseModel):
+    """Generic anti-enumeration response confirming password reset request handling."""
+
+    message: str = Field(
+        default="If an account exists for this email, password reset instructions will be sent.",
+        description="Generic message preventing account enumeration attacks.",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    """Payload submitted to reset password using single-use raw reset token."""
+
+    token: str = Field(
+        ...,
+        min_length=1,
+        description="Opaque password reset token received via email fragment",
+        examples=["abcdef1234567890"],
+    )
+    new_password: str = Field(
+        ...,
+        description="New plaintext password to be validated against security policy and hashed",
+        examples=["NewSecurePassword123!"],
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("token")
+    @classmethod
+    def validate_token(cls, v: str) -> str:
+        """Reject empty or whitespace-only reset tokens."""
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("Password reset token cannot be empty or whitespace-only.")
+        return stripped
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_password_rules(cls, v: str) -> str:
+        """Enforce standard system password policy rules via Argon2id validator."""
+        validate_password_policy(v)
+        return v
+
+
+class PasswordResetConfirmResponse(BaseModel):
+    """Payload returned upon successful password reset."""
+
+    message: str = Field(
+        default="Password has been reset successfully. Please log in with your new password.",
+        description="Confirmation message of successful password reset.",
+    )
+
+    model_config = ConfigDict(extra="forbid")

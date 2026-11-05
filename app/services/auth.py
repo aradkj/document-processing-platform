@@ -218,7 +218,7 @@ async def authenticate_user(
     refresh_delta = timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
     refresh_expires_at = now + refresh_delta
 
-    access_token = create_access_token(subject=str(user.id))
+    access_token = create_access_token(subject=str(user.id), auth_version=user.auth_version)
     refresh_token = create_refresh_token(
         subject=str(user.id),
         expires_delta=refresh_delta,
@@ -349,7 +349,7 @@ async def refresh_access_token(
     new_refresh_jti = uuid.uuid4().hex
 
     # 1. Create new short-lived access token
-    new_access_token = create_access_token(subject=str(user.id))
+    new_access_token = create_access_token(subject=str(user.id), auth_version=user.auth_version)
     # 2. Create new rotated refresh token with the same family_id
     new_refresh_token = create_refresh_token(
         subject=str(user.id),
@@ -431,9 +431,40 @@ async def revoke_refresh_token(session: AsyncSession, refresh_token: str) -> boo
     return True
 
 
+async def revoke_all_user_refresh_tokens(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    commit: bool = True,
+) -> int:
+    """Revoke all active refresh tokens and sessions for a user (e.g. on password reset)."""
+    now = datetime.now(UTC)
+    stmt = (
+        update(RefreshToken)
+        .where(
+            RefreshToken.user_id == user_id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    result = await session.execute(stmt)
+    if commit:
+        await session.commit()
+    revoked_count = int(getattr(result, "rowcount", 0))
+    logger.info("Revoked %d refresh tokens for user_id=%s", revoked_count, user_id)
+    return revoked_count
+
+
 async def get_user_by_id(session: AsyncSession, user_id: uuid.UUID) -> User | None:
     """Retrieve an active or inactive user by primary key UUID."""
     result = await session.execute(select(User).where(User.id == user_id))
+    return result.scalar_one_or_none()
+
+
+async def get_user_by_email(session: AsyncSession, email: str) -> User | None:
+    """Retrieve an active or inactive user by normalized email address."""
+    normalized = email.strip().lower()
+    result = await session.execute(select(User).where(func.lower(User.email) == normalized))
     return result.scalar_one_or_none()
 
 

@@ -100,11 +100,16 @@ class Settings(BaseSettings):
         description="JWT token audience claim (aud)",
     )
 
-    # Email Verification & SMTP Configuration
+    # Email Verification, Password Reset & SMTP Configuration
     EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES: int = Field(
         default=30,
         ge=1,
         description="Lifetime of email verification tokens in minutes",
+    )
+    PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = Field(
+        default=30,
+        ge=1,
+        description="Lifetime of password reset tokens in minutes",
     )
     SMTP_HOST: str = Field(
         default="localhost",
@@ -156,6 +161,16 @@ class Settings(BaseSettings):
         if not v.startswith("postgresql+asyncpg://"):
             raise ValueError(
                 "DATABASE_URL must use 'postgresql+asyncpg://' driver scheme for async access."
+            )
+        return v
+
+    @field_validator("FRONTEND_BASE_URL")
+    @classmethod
+    def validate_frontend_base_url_scheme(cls, v: str) -> str:
+        """Ensure FRONTEND_BASE_URL is a valid absolute URL scheme."""
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError(
+                "FRONTEND_BASE_URL must be a valid absolute URL starting with http:// or https://."
             )
         return v
 
@@ -211,11 +226,15 @@ class Settings(BaseSettings):
                     "Configure a production SMTP server via SMTP_HOST and SMTP_PORT."
                 )
             frontend_lower = self.FRONTEND_BASE_URL.lower()
+            if not self.FRONTEND_BASE_URL.startswith("https://"):
+                raise ValueError("FRONTEND_BASE_URL must use HTTPS in production.")
             if "localhost" in frontend_lower or "127.0.0.1" in frontend_lower:
                 raise ValueError(
                     "FRONTEND_BASE_URL must not point to localhost/127.0.0.1 in production. "
                     "Configure the public production frontend application URL."
                 )
+            if self.SMTP_USERNAME and not (self.SMTP_USE_TLS or self.SMTP_USE_SSL):
+                raise ValueError("Authenticated SMTP must use TLS or SSL encryption in production.")
             if (
                 self.SMTP_FROM_EMAIL.endswith(".local")
                 or self.SMTP_FROM_EMAIL == "noreply@example.com"

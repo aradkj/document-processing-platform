@@ -11,6 +11,10 @@ from app.db.models.user import User
 from app.db.session import get_db_session
 from app.schemas.auth import (
     LogoutResponse,
+    PasswordResetConfirmRequest,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
     RefreshTokenRequest,
     ResendVerificationResponse,
     TokenResponse,
@@ -39,6 +43,11 @@ from app.services.email_verification import (
     InvalidVerificationTokenError,
     resend_verification_email,
     verify_email_token,
+)
+from app.services.password_reset import (
+    InvalidPasswordResetTokenError,
+    confirm_password_reset,
+    request_password_reset,
 )
 
 logger = logging.getLogger(__name__)
@@ -360,3 +369,75 @@ async def resend_verification(
     """Resend email verification token for authenticated user."""
     await resend_verification_email(session=session, user=current_user)
     return ResendVerificationResponse(message="Verification email sent if account is unverified.")
+
+
+@router.post(
+    "/password-reset/request",
+    response_model=PasswordResetRequestResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Request password reset email",
+    description=(
+        "Initiate password reset process for an account. If an active account matches "
+        "the supplied email, a secure single-use reset token is generated and emailed. "
+        "Returns an identical generic response regardless of whether the email exists, "
+        "is inactive, or nonexistent to prevent account enumeration attacks."
+    ),
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Generic acknowledgement of password reset request.",
+            "model": PasswordResetRequestResponse,
+        },
+        422: {
+            "description": "Validation error (invalid email format).",
+        },
+    },
+)
+async def request_password_reset_endpoint(
+    payload: PasswordResetRequest,
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> PasswordResetRequestResponse:
+    """Public endpoint to request password reset token dispatch."""
+    await request_password_reset(session=session, email=payload.email)
+    return PasswordResetRequestResponse()
+
+
+@router.post(
+    "/password-reset/confirm",
+    response_model=PasswordResetConfirmResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Confirm password reset",
+    description=(
+        "Atomically consume a single-use password reset token, update user password hash "
+        "with Argon2id, increment user authentication version, and revoke all active "
+        "refresh token families to invalidate all existing sessions."
+    ),
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Password reset successfully.",
+            "model": PasswordResetConfirmResponse,
+        },
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "Token is invalid, expired, consumed, invalidated, or email mismatch.",
+        },
+        422: {
+            "description": "Validation error (e.g. password does not satisfy security policy).",
+        },
+    },
+)
+async def confirm_password_reset_endpoint(
+    payload: PasswordResetConfirmRequest,
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> PasswordResetConfirmResponse:
+    """Public endpoint to confirm password reset and update password."""
+    try:
+        await confirm_password_reset(
+            session=session,
+            raw_token=payload.token,
+            new_password=payload.new_password,
+        )
+        return PasswordResetConfirmResponse()
+    except InvalidPasswordResetTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc

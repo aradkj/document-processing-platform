@@ -139,6 +139,7 @@ def create_access_token(
     subject: str | uuid.UUID,
     expires_delta: timedelta | None = None,
     extra_claims: dict[str, Any] | None = None,
+    auth_version: int = 0,
 ) -> str:
     """Create a cryptographically signed JWT access token.
 
@@ -150,6 +151,7 @@ def create_access_token(
     - iss: configured issuer
     - aud: configured audience
     - type: 'access'
+    - auth_version: current authentication version integer
     """
     settings = get_settings()
     now = datetime.now(UTC)
@@ -166,11 +168,12 @@ def create_access_token(
         "iss": settings.JWT_ISSUER,
         "aud": settings.JWT_AUDIENCE,
         "type": "access",
+        "auth_version": auth_version,
     }
 
     if extra_claims:
         for key, value in extra_claims.items():
-            if key not in {"sub", "iat", "exp", "type"}:
+            if key not in {"sub", "iat", "exp", "type", "auth_version"}:
                 payload[key] = value
 
     return jwt.encode(
@@ -352,4 +355,14 @@ def generate_email_verification_token() -> str:
 
 def hash_email_verification_token(raw_token: str) -> str:
     """Hash raw verification token using SHA-256 for secure, irreversible database persistence."""
+    return hashlib.sha256(raw_token.strip().encode("utf-8")).hexdigest()
+
+
+def generate_password_reset_token() -> str:
+    """Generate a cryptographically secure, opaque random password reset token (>=256 bits)."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_password_reset_token(raw_token: str) -> str:
+    """Hash raw password reset token using SHA-256 for secure, irreversible database persistence."""
     return hashlib.sha256(raw_token.strip().encode("utf-8")).hexdigest()

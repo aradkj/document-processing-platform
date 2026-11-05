@@ -4,13 +4,14 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Boolean, DateTime, Index, String, Uuid, func, text
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.db.models.email_verification_token import EmailVerificationToken
+    from app.db.models.password_reset_token import PasswordResetToken
     from app.db.models.refresh_token import RefreshToken
     from app.db.models.role import Role
 
@@ -57,6 +58,12 @@ class User(Base):
         server_default=text("false"),
         nullable=False,
     )
+    auth_version: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
+    )
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -93,6 +100,12 @@ class User(Base):
         cascade="all, delete-orphan",
         lazy="raise",
     )
+    password_reset_tokens: Mapped[list["PasswordResetToken"]] = relationship(
+        "PasswordResetToken",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="raise",
+    )
 
     def __init__(
         self,
@@ -103,6 +116,7 @@ class User(Base):
         password_hash: str,
         is_active: bool = True,
         is_verified: bool = False,
+        auth_version: int = 0,
         last_login_at: datetime | None = None,
         **kwargs: Any,
     ) -> None:
@@ -114,6 +128,7 @@ class User(Base):
             password_hash=password_hash,
             is_active=is_active,
             is_verified=is_verified,
+            auth_version=auth_version,
             last_login_at=last_login_at,
             **kwargs,
         )

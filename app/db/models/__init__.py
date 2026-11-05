@@ -1,6 +1,7 @@
 """Database domain models package."""
 
 from app.db.models.email_verification_token import EmailVerificationToken
+from app.db.models.password_reset_token import PasswordResetToken
 from app.db.models.permission import Permission
 from app.db.models.refresh_token import RefreshToken
 from app.db.models.role import Role
@@ -10,6 +11,7 @@ from app.db.models.user_role import UserRole
 
 __all__ = [
     "EmailVerificationToken",
+    "PasswordResetToken",
     "Permission",
     "RefreshToken",
     "Role",

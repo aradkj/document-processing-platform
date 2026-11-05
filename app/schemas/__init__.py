@@ -2,6 +2,10 @@
 
 from app.schemas.auth import (
     LogoutResponse,
+    PasswordResetConfirmRequest,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
     RefreshTokenRequest,
     ResendVerificationResponse,
     TokenResponse,
@@ -17,6 +21,10 @@ from app.schemas.auth import (
 
 __all__ = [
     "LogoutResponse",
+    "PasswordResetConfirmRequest",
+    "PasswordResetConfirmResponse",
+    "PasswordResetRequest",
+    "PasswordResetRequestResponse",
     "RefreshTokenRequest",
     "ResendVerificationResponse",
     "TokenResponse",

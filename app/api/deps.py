@@ -99,4 +99,18 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Validate that the access token auth_version matches user's current version
+    token_auth_version = payload.get("auth_version")
+    if token_auth_version is None or token_auth_version != user.auth_version:
+        logger.info(
+            "Authentication rejected: auth_version mismatch or missing (token=%s, user=%s)",
+            token_auth_version,
+            user.auth_version,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     return user

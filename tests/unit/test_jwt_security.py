@@ -384,3 +384,18 @@ def test_token_type_separation_access_vs_refresh() -> None:
     with pytest.raises(TokenInvalidError) as exc2:
         decode_access_token(refresh_token)
     assert "expected access token" in str(exc2.value).lower()
+
+
+def test_access_token_auth_version_claim() -> None:
+    """Verify that create_access_token properly embeds auth_version and decode preserves it."""
+    user_id = uuid.uuid4()
+
+    # Default auth_version
+    token_v0 = create_access_token(subject=user_id)
+    payload_v0 = decode_access_token(token_v0)
+    assert payload_v0.get("auth_version") == 0
+
+    # Custom auth_version
+    token_v3 = create_access_token(subject=user_id, auth_version=3)
+    payload_v3 = decode_access_token(token_v3)
+    assert payload_v3.get("auth_version") == 3
