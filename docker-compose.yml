@@ -39,6 +39,11 @@ services:
       API_PORT: 8000
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_LOCAL_ROOT: ${STORAGE_LOCAL_ROOT:-/app/storage_data}
+      STORAGE_CHUNK_SIZE: ${STORAGE_CHUNK_SIZE:-1048576}
+    volumes:
+      - storage_data:/app/storage_data
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:
@@ -59,3 +64,6 @@ services:
 volumes:
   postgres_data:
     driver: local
+  storage_data:
+    driver: local
+

@@ -12,6 +12,7 @@ from app.api.v1 import api_v1_router
 from app.core.config import get_settings
 from app.core.logging import setup_logging
 from app.db.session import close_engine
+from app.storage import create_storage_backend
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +30,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "debug": settings.DEBUG,
         },
     )
+    # Initialize storage backend
+    storage = create_storage_backend(settings)
+    try:
+        await storage.initialize()
+    except Exception:
+        await storage.close()
+        raise
+    app.state.storage = storage
+    logger.info("Storage backend '%s' initialized successfully", settings.STORAGE_BACKEND)
     try:
         yield
     finally:
         logger.info("Application shutting down, closing resources...")
-        await close_engine()
+        try:
+            await storage.close()
+        except Exception as exc:
+            logger.error("Error closing storage backend: %s", exc)
+        finally:
+            await close_engine()
         logger.info("Application shutdown complete.")
 
 

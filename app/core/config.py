@@ -150,9 +150,36 @@ class Settings(BaseSettings):
         description="Base URL of frontend application for verification links",
     )
 
+    # Storage Configuration (Phase 3.1)
+    STORAGE_BACKEND: Literal["local"] = Field(
+        default="local",
+        description="Active storage backend identifier (currently: 'local')",
+    )
+    STORAGE_LOCAL_ROOT: str = Field(
+        default="./storage_data",
+        description="Base directory for local filesystem storage",
+    )
+    STORAGE_CHUNK_SIZE: int = Field(
+        default=1048576,  # 1 MiB (1024 * 1024 bytes)
+        ge=65536,  # min 64 KiB
+        le=16777216,  # max 16 MiB
+        description="Chunk size in bytes for streaming file read/write operations",
+    )
+
     def __init__(self, _env_file: str | None = ".env", **values: Any) -> None:
         """Initialize settings with optional env_file override."""
         super().__init__(_env_file=_env_file, **values)
+
+    @field_validator("STORAGE_LOCAL_ROOT")
+    @classmethod
+    def validate_storage_local_root(cls, v: str) -> str:
+        """Validate storage local root path format and prevent null bytes or empty path."""
+        if not v or not v.strip():
+            raise ValueError("STORAGE_LOCAL_ROOT must not be empty.")
+        cleaned = v.strip()
+        if "\0" in cleaned:
+            raise ValueError("STORAGE_LOCAL_ROOT cannot contain null bytes.")
+        return cleaned
 
     @field_validator("DATABASE_URL")
     @classmethod
@@ -241,6 +268,14 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(
                     "SMTP_FROM_EMAIL must be configured with a valid domain in production."
+                )
+            # Production storage root safety check
+            unsafe_roots = {"/", "/etc", "/bin", "/boot", "/dev", "/usr", "/sys", "/proc"}
+            normalized_root = self.STORAGE_LOCAL_ROOT.strip().rstrip("/\\")
+            if normalized_root in unsafe_roots:
+                raise ValueError(
+                    "STORAGE_LOCAL_ROOT cannot be set to a critical system directory: "
+                    f"{normalized_root}"
                 )
         return self
 

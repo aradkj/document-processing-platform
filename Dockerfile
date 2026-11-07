@@ -38,6 +38,9 @@ COPY --chown=appuser:appgroup alembic.ini ./
 COPY --chown=appuser:appgroup alembic/ ./alembic/
 COPY --chown=appuser:appgroup app/ ./app/
 
+# Create persistent storage directory with correct permissions for non-root user
+RUN mkdir -p /app/storage_data && chown -R appuser:appgroup /app/storage_data
+
 # Switch to non-root user
 USER appuser
 
