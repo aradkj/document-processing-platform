@@ -10,6 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.db.models.document import Document
     from app.db.models.email_verification_token import EmailVerificationToken
     from app.db.models.password_reset_token import PasswordResetToken
     from app.db.models.refresh_token import RefreshToken
@@ -104,6 +105,12 @@ class User(Base):
         "PasswordResetToken",
         back_populates="user",
         cascade="all, delete-orphan",
+        lazy="raise",
+    )
+    documents: Mapped[list["Document"]] = relationship(
+        "Document",
+        back_populates="user",
+        passive_deletes=True,
         lazy="raise",
     )
 

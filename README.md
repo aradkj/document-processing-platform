@@ -4,21 +4,22 @@ A modern, high-performance, and secure asynchronous backend for the Document Pro
 
 ## Current Phase
 
-**Phase 2 — Authentication & Users (Completed)**
+**Phase 3.2 — Document Data Model & Database Implementation (Completed)**
 
-This repository provides a production-conscious authentication and user management foundation built with FastAPI, SQLAlchemy 2.x (async), PostgreSQL, Alembic, Argon2id, and JWTs:
-- **Case-Insensitive Identity & Unique Constraints:** Email and username uniqueness guaranteed at the database level with functional indexes.
-- **Argon2id Password Security:** Memory-hard hashing using `argon2-cffi` (`m=65536, t=3, p=4`), Unicode normalization (NFKC), and strict password policy.
-- **Role & Permission Foundation:** Pre-seeded roles (`admin`, `user`) and transactional default role assignment during registration.
-- **Dual-Token JWT Architecture:** Short-lived access tokens (HS256 with strict algorithm pinning) paired with persistent refresh tokens in PostgreSQL.
-- **Refresh Token Rotation & Reuse Detection:** Single-use rotation with token family tracking; compromised families are instantly and automatically revoked.
-- **Instant Global Session Invalidation:** Incrementing persistent `auth_version` on [User](app/db/models/user.py) terminates all existing access tokens live upon password reset.
-- **Email Verification & Password Reset:** High-entropy single-use tokens hashed with SHA-256 before storage; delivered safely via URL hash fragments (`#token=...`).
-- **Anti-Enumeration Protection:** Generic uniform responses and constant-time dummy password hashing for nonexistent and inactive accounts.
-- **Strict Pydantic Validation:** All request and response schemas forbid extra fields, sanitize outputs, and protect internal identifiers and hashes.
-- **Operational Health Checks:** Liveness (`/health`) and timeout-shielded PostgreSQL Readiness (`/ready`).
+The platform provides a production-grade authentication engine (Phase 2), a decoupled storage abstraction (Phase 3.1), and a robust document metadata database foundation (Phase 3.2):
+- **Document Domain Model:** Full SQLAlchemy `Document` model tracking logical identity, owner reference, opaque storage key, display filename, content type, 64-bit size, and SHA-256 checksum.
+- **Database-Level Integrity Constraints:** Native PostgreSQL check constraints validating 32-character lowercase hex storage keys, 64-character SHA-256 checksums, and non-negative file sizing.
+- **Optimized B-tree Indexing:** Composite index `(user_id, created_at)` optimizing owner queries and ordered pagination without duplicate standalone index overhead.
+- **User Deletion Protection:** Foreign key `ON DELETE RESTRICT` with `passive_deletes=True` preventing parent user deletion from orphaning external physical files on storage.
+- **Alembic Migration 0010:** Clean, bidirectional migration with verified upgrade, downgrade, and re-upgrade cycles against live PostgreSQL.
+- **Abstract Storage Backend:** Clean asynchronous contracts (`StorageBackend`, `StoredObjectReader`) independent of web frameworks, HTTP uploads, and database models.
+- **Local Filesystem Implementation:** `LocalStorage` backend with cryptographically secure, opaque 32-hex keys partitioned across 2-level subdirectories (`ab/cd/abcdef...`).
+- **Bounded Memory Streaming:** Chunked streaming for reading and writing (1MB buffer), preventing memory exhaustion.
+- **Atomic File Writes & Cleanup:** Temporary staging writes with automatic rollback/cleanup on stream failures; atomic promotion via `os.replace`.
+- **Security Hardening:** Strict path traversal protection, symlink escape rejection, overwrite prevention, and absolute internal path masking.
+- **Full Authentication System:** Case-insensitive identity, Argon2id hashing, dual-token JWT, refresh token rotation & reuse detection, email verification, and password reset.
 
-*Note: Document storage, OCR processing pipelines, async workers, search, and AI features belong to future phases (Phase 3+) and are not implemented in Phase 2.*
+*Note: Document upload/download HTTP endpoints, MIME validation, OCR processing pipelines, async workers, search, and AI features belong to subsequent Phase 3 sub-phases (starting with Phase 3.3).*
 
 ---
 
@@ -66,7 +67,7 @@ graph TD
 │   └── workflows/
 │       └── ci.yml             # GitHub Actions CI workflow (lint, typecheck, migrations, tests)
 ├── alembic/                   # Database migrations configuration & versions
-│   ├── versions/              # Reversible migration scripts (0001 through 0009)
+│   ├── versions/              # Reversible migration scripts (0001 through 0010)
 │   ├── env.py                 # Alembic async environment
 │   └── script.py.mako         # Migration script template
 ├── app/
@@ -97,14 +98,21 @@ graph TD
 │   ├── schemas/
 │   │   ├── __init__.py
 │   │   └── auth.py            # Pydantic request/response schemas with extra='forbid'
-│   └── services/
-│       ├── __init__.py
-│       ├── auth.py            # Registration, login, token rotation, profile updates
-│       ├── email.py           # Email service with mock transport and async SMTP dispatch
-│       ├── email_verification.py # Token issuance, concurrent resend locks, verification
-│       └── password_reset.py  # Anti-enumeration request, atomic confirm, session revocation
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── auth.py            # Registration, login, token rotation, profile updates
+│   │   ├── email.py           # Email service with mock transport and async SMTP dispatch
+│   │   ├── email_verification.py # Token issuance, concurrent resend locks, verification
+│   │   └── password_reset.py  # Anti-enumeration request, atomic confirm, session revocation
+│   └── storage/               # Decoupled file storage foundation
+│       ├── __init__.py        # Factory, caching & FastAPI dependency (get_storage)
+│       ├── base.py            # Abstract StorageBackend & StoredObjectReader interfaces
+│       ├── exceptions.py      # Structured storage exception hierarchy
+│       ├── local.py           # LocalStorage backend with atomic writes & chunked streaming
+│       └── types.py           # StorageMetadata, StoredObject, BinaryStream protocols
 ├── docs/                      # Architectural documentation & audit reports
-│   └── phase-2-final-review.md
+│   ├── phase-2-final-review.md
+│   └── storage-architecture.md # Storage architecture, security & streaming contracts
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py            # Pytest fixtures, test database engine & HTTPX async clients
@@ -313,6 +321,49 @@ pytest tests/integration -v
 | `SMTP_FROM_EMAIL` | string | `noreply@docplatform.local` | From address for outgoing system emails |
 | `SMTP_FROM_NAME` | string | `Document Processing Platform` | Sender name in email headers |
 | `FRONTEND_BASE_URL` | string | `http://localhost:3000` | Public frontend URL for email link generation |
+| `STORAGE_BACKEND` | enum | `local` | Storage backend driver (`local`; future: `s3`) |
+| `STORAGE_LOCAL_ROOT` | string | `./storage_data` | Root filesystem directory for local file persistence |
+| `STORAGE_CHUNK_SIZE` | integer | `1048576` | Streaming I/O chunk size in bytes (64KB - 16MB) |
+
+---
+
+## Storage Architecture & Foundation (Phase 3.1)
+
+The platform incorporates a decoupled, production-grade file storage architecture located under `app/storage/`.
+
+### Architecture & Abstraction
+- **Abstract Interface:** `StorageBackend` (`app/storage/base.py`) defines neutral asynchronous methods: `save()`, `open()`, `delete()`, `exists()`, `get_metadata()`, `generate_key()`, `initialize()`, and `close()`.
+- **Zero Web / DB Coupling:** The storage layer operates independently from FastAPI `UploadFile`, SQLAlchemy models, or document business rules. Future backends (e.g. AWS S3 / MinIO) can be introduced without altering application code.
+- **FastAPI Dependency Injection:** Accessible via `get_storage` dependency (`app.storage.get_storage`), referencing the initialized singleton created during application lifespan (`app.state.storage`).
+
+### Local Filesystem Backend (`LocalStorage`)
+- **Opaque Storage Keys:** User-provided filenames are never written directly to the filesystem. Instead, cryptographically random 32-character hexadecimal keys (`secrets.token_hex(16)`) are generated.
+- **Directory Partitioning:** Keys are stored in a two-tier directory tree: `<root>/ab/cd/abcdef...` (256 × 256 = 65,536 subdirectories), preventing filesystem inode lookup degradation.
+- **Bounded-Memory Streaming:** Both writes and reads are chunked (default 1MB buffer), offloading blocking disk I/O to worker threads via `asyncio.to_thread`.
+- **Atomic Writes & Rollback:** Uploads are written to staging files (`.tmp_<random>_<name>`) in the target directory and atomically promoted via `os.replace`. If an error occurs mid-stream, partial files are immediately purged and `StorageWriteError` is raised.
+- **Safe Directory Pruning:** Deletion of the last file in a partition automatically cleans up empty parent directories up to the storage root.
+
+### Storage Security Guarantees
+- **Path Traversal & Absolute Path Rejection:** Storage keys are strictly validated against `^[a-f0-9]{32}$`. Any key with `..`, `\0`, or path separators is rejected with `StorageInvalidKeyError`.
+- **Symlink Escape Detection:** Resolved paths are verified to reside strictly under `STORAGE_LOCAL_ROOT` with `is_relative_to`. Any symlink in the hierarchy raises `StorageSecurityError`.
+- **Information Disclosure Protection:** Low-level filesystem errors are captured and translated into high-level storage exceptions without exposing absolute server paths.
+- **Fail-Fast Startup Probe:** At startup, `initialize()` creates the storage root and verifies write permissions with a temporary probe file (`.probe_<token>`). Inability to write halts application startup immediately with `StoragePermissionError`.
+
+### Docker Persistence & Local Development
+- **Docker Compose:** Persistent named volume `storage_data` is mounted to `/app/storage_data` in the API container:
+  ```yaml
+  volumes:
+    - storage_data:/app/storage_data
+  ```
+- **Non-Root Ownership:** The `Dockerfile` provisions `/app/storage_data` owned by `appuser:appgroup` before dropping privileges. Data safely persists across container rebuilds.
+- **Local Dev Directory:** Locally, files default to `./storage_data/`.
+- **Resetting Local Storage:** To reset local storage during development without touching databases:
+  ```bash
+  # Delete local directory:
+  rm -rf ./storage_data/*
+  # In Docker:
+  docker compose down -v  # wipes both database and storage volumes
+  ```
 
 ---
 
