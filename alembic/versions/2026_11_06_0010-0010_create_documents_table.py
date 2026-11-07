@@ -75,4 +75,3 @@ def downgrade() -> None:
     """Drop documents table and associated indexes/constraints."""
     op.drop_index(op.f("ix_documents_user_id_created_at"), table_name="documents")
     op.drop_table("documents")
-

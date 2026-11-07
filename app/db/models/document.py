@@ -113,4 +113,3 @@ class Document(Base):
             f"<Document id={self.id} user_id={self.user_id} "
             f"storage_key={self.storage_key} filename={self.original_filename!r}>"
         )
-
