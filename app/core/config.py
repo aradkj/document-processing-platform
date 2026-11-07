@@ -166,6 +166,14 @@ class Settings(BaseSettings):
         description="Chunk size in bytes for streaming file read/write operations",
     )
 
+    # Document Upload Configuration (Phase 3.3)
+    MAX_UPLOAD_SIZE_BYTES: int = Field(
+        default=20971520,  # 20 MiB (20 * 1024 * 1024 bytes)
+        ge=1,  # minimum 1 byte
+        le=524288000,  # maximum 500 MiB
+        description="Maximum allowed document upload file size in bytes (default: 20 MiB)",
+    )
+
     def __init__(self, _env_file: str | None = ".env", **values: Any) -> None:
         """Initialize settings with optional env_file override."""
         super().__init__(_env_file=_env_file, **values)

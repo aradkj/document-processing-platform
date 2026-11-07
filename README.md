@@ -4,22 +4,25 @@ A modern, high-performance, and secure asynchronous backend for the Document Pro
 
 ## Current Phase
 
-**Phase 3.2 — Document Data Model & Database Implementation (Completed)**
+**Phase 3.3 — Secure Document Upload (Completed)**
 
-The platform provides a production-grade authentication engine (Phase 2), a decoupled storage abstraction (Phase 3.1), and a robust document metadata database foundation (Phase 3.2):
+The platform provides a production-grade authentication engine (Phase 2), a decoupled storage abstraction (Phase 3.1), a robust document metadata database foundation (Phase 3.2), and a hardened document upload subsystem (Phase 3.3):
+- **Authenticated Secure Document Upload:** `POST /api/v1/documents` endpoint enforcing JWT Bearer authentication, accepting multipart form uploads under the `file` field with strict client-tamper protection (`user_id` derived exclusively from server authentication context).
+- **Strict Filename Validation & Normalization:** Unicode NFC normalization, null byte (`\0`, `%00`), path separator (`/`, `\\`), colon (`:`), traversal (`..`), control character, and length boundary (1–255 chars) validation. Missing stems or extensions are rejected.
+- **Content-Type Signature Detection (Magic Bytes):** Trustworthy signature inspection for PDF (`%PDF-`), JPEG (`\xFF\xD8\xFF`), PNG (`\x89PNG\r\n\x1a\n`), TIFF (`II*\x00` and `MM\x00*`), and WebP (`RIFF...WEBP`). Spoofing prevention via strict extension-to-signature cross-validation.
+- **Bounded-Memory Streaming & Quota Enforcement:** Asynchronous generator streaming in chunks (default 1MB buffer) directly to `StorageBackend` without buffering entire payloads in memory; configurable size quota via `MAX_UPLOAD_SIZE_BYTES` (default 20MB) with early stream termination and incremental SHA-256 calculation.
+- **Transactional Consistency & Storage Compensation:** Persistence to PostgreSQL `documents` table tied to authenticated `user.id`. If database persistence or transaction commit fails, two-phase compensation triggers an immediate physical unlink via `storage.delete(storage_key, missing_ok=True)` to prevent orphaned files.
 - **Document Domain Model:** Full SQLAlchemy `Document` model tracking logical identity, owner reference, opaque storage key, display filename, content type, 64-bit size, and SHA-256 checksum.
 - **Database-Level Integrity Constraints:** Native PostgreSQL check constraints validating 32-character lowercase hex storage keys, 64-character SHA-256 checksums, and non-negative file sizing.
 - **Optimized B-tree Indexing:** Composite index `(user_id, created_at)` optimizing owner queries and ordered pagination without duplicate standalone index overhead.
-- **User Deletion Protection:** Foreign key `ON DELETE RESTRICT` with `passive_deletes=True` preventing parent user deletion from orphaning external physical files on storage.
+- **User Deletion Protection:** Foreign key `ON DELETE RESTRICT` with `passive_deletes="all"` preventing parent user deletion from orphaning external physical files on storage and suppressing in-memory foreign key nullification.
 - **Alembic Migration 0010:** Clean, bidirectional migration with verified upgrade, downgrade, and re-upgrade cycles against live PostgreSQL.
 - **Abstract Storage Backend:** Clean asynchronous contracts (`StorageBackend`, `StoredObjectReader`) independent of web frameworks, HTTP uploads, and database models.
 - **Local Filesystem Implementation:** `LocalStorage` backend with cryptographically secure, opaque 32-hex keys partitioned across 2-level subdirectories (`ab/cd/abcdef...`).
-- **Bounded Memory Streaming:** Chunked streaming for reading and writing (1MB buffer), preventing memory exhaustion.
-- **Atomic File Writes & Cleanup:** Temporary staging writes with automatic rollback/cleanup on stream failures; atomic promotion via `os.replace`.
-- **Security Hardening:** Strict path traversal protection, symlink escape rejection, overwrite prevention, and absolute internal path masking.
+- **Atomic File Writes & Cleanup:** Temporary staging writes with automatic rollback/cleanup on stream failures; atomic publication via hard link (`os.link`) with fail-closed protection on unsupported filesystems.
 - **Full Authentication System:** Case-insensitive identity, Argon2id hashing, dual-token JWT, refresh token rotation & reuse detection, email verification, and password reset.
 
-*Note: Document upload/download HTTP endpoints, MIME validation, OCR processing pipelines, async workers, search, and AI features belong to subsequent Phase 3 sub-phases (starting with Phase 3.3).*
+*Note: Document listing, detail lookup, download, deletion, OCR processing pipelines, async workers, search, and AI features belong to subsequent Phase 3 and Phase 4 sub-phases (starting with Phase 3.4).*
 
 ---
 
@@ -79,7 +82,8 @@ graph TD
 │   │   ├── health.py          # Liveness (/health) & Readiness (/ready) probes
 │   │   └── v1/
 │   │       ├── __init__.py    # Version 1 router aggregator
-│   │       └── auth.py        # 10 Authentication endpoints (register, login, refresh, me, reset, etc.)
+│   │       ├── auth.py        # 10 Authentication endpoints (register, login, refresh, me, reset, etc.)
+│   │       └── documents.py   # Document upload endpoint (POST /api/v1/documents)
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py          # Pydantic Settings with production guardrails
@@ -90,17 +94,21 @@ graph TD
 │   │   ├── base.py            # DeclarativeBase with custom table naming
 │   │   ├── session.py         # Async engine, connection pool & explicit transaction strategy
 │   │   └── models/            # SQLAlchemy ORM models
-│   │       ├── user.py        # User entity with auth_version
+│   │       ├── user.py        # User entity with auth_version and passive_deletes="all"
 │   │       ├── role.py        # Role, Permission, UserRole, RolePermission
 │   │       ├── refresh_token.py # RefreshToken with family_id, jti, revocation
 │   │       ├── email_verification_token.py # EmailVerificationToken with SHA-256 hash
-│   │       └── password_reset_token.py     # PasswordResetToken with SHA-256 hash
+│   │       ├── password_reset_token.py     # PasswordResetToken with SHA-256 hash
+│   │       └── document.py    # Document entity with storage_key, checksum, size, metadata
 │   ├── schemas/
 │   │   ├── __init__.py
-│   │   └── auth.py            # Pydantic request/response schemas with extra='forbid'
+│   │   ├── auth.py            # Pydantic request/response schemas with extra='forbid'
+│   │   └── document.py        # DocumentResponse schema with extra='forbid' and UUID/datetime serialization
 │   ├── services/
 │   │   ├── __init__.py
 │   │   ├── auth.py            # Registration, login, token rotation, profile updates
+│   │   ├── document.py        # Document upload orchestration, bounded streaming & compensation
+│   │   ├── document_validation.py # Filename sanitization, magic-byte detection, extension matching
 │   │   ├── email.py           # Email service with mock transport and async SMTP dispatch
 │   │   ├── email_verification.py # Token issuance, concurrent resend locks, verification
 │   │   └── password_reset.py  # Anti-enumeration request, atomic confirm, session revocation
@@ -112,12 +120,13 @@ graph TD
 │       └── types.py           # StorageMetadata, StoredObject, BinaryStream protocols
 ├── docs/                      # Architectural documentation & audit reports
 │   ├── phase-2-final-review.md
-│   └── storage-architecture.md # Storage architecture, security & streaming contracts
+│   ├── storage-architecture.md # Storage architecture, security & streaming contracts (Phase 3.1)
+│   └── document-architecture.md # Document model, database integrity & upload architecture (Phase 3.2 - 3.3)
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py            # Pytest fixtures, test database engine & HTTPX async clients
-│   ├── unit/                  # Unit tests (schemas, config, tokens, models, JWT, OpenAPI)
-│   └── integration/           # Integration tests against live PostgreSQL
+│   ├── unit/                  # Unit tests (schemas, config, tokens, models, JWT, OpenAPI, validation, service)
+│   └── integration/           # Integration tests against live PostgreSQL & storage (auth, storage, documents, upload)
 ├── .env.example               # Reference configuration with development defaults
 ├── Dockerfile                 # Production multi-stage Dockerfile running as appuser
 ├── docker-compose.yml         # Local stack orchestration (API, PostgreSQL, Mailpit)
@@ -246,7 +255,7 @@ alembic upgrade head
 
 # Verify current revision
 alembic current
-# Expected output: 0009_password_reset_tokens (head)
+# Expected output: 0010_create_documents_table (head)
 ```
 
 ### 5. Start the Application
@@ -278,7 +287,7 @@ ruff format --check .
 # 3. Run Mypy strict type checking
 mypy app tests
 
-# 4. Run full test suite (322 tests)
+# 4. Run full test suite (520 tests: 512 passed, 8 skipped on Windows)
 pytest -v
 
 # 5. Run unit tests only
@@ -324,6 +333,7 @@ pytest tests/integration -v
 | `STORAGE_BACKEND` | enum | `local` | Storage backend driver (`local`; future: `s3`) |
 | `STORAGE_LOCAL_ROOT` | string | `./storage_data` | Root filesystem directory for local file persistence |
 | `STORAGE_CHUNK_SIZE` | integer | `1048576` | Streaming I/O chunk size in bytes (64KB - 16MB) |
+| `MAX_UPLOAD_SIZE_BYTES` | integer | `20971520` | Maximum allowed document upload size in bytes (1B - 500MB) |
 
 ---
 
@@ -340,7 +350,7 @@ The platform incorporates a decoupled, production-grade file storage architectur
 - **Opaque Storage Keys:** User-provided filenames are never written directly to the filesystem. Instead, cryptographically random 32-character hexadecimal keys (`secrets.token_hex(16)`) are generated.
 - **Directory Partitioning:** Keys are stored in a two-tier directory tree: `<root>/ab/cd/abcdef...` (256 × 256 = 65,536 subdirectories), preventing filesystem inode lookup degradation.
 - **Bounded-Memory Streaming:** Both writes and reads are chunked (default 1MB buffer), offloading blocking disk I/O to worker threads via `asyncio.to_thread`.
-- **Atomic Writes & Rollback:** Uploads are written to staging files (`.tmp_<random>_<name>`) in the target directory and atomically promoted via `os.replace`. If an error occurs mid-stream, partial files are immediately purged and `StorageWriteError` is raised.
+- **Atomic Writes & Rollback:** Uploads are written to staging files (`.tmp_<random>_<name>`) in the target directory and published atomically via hard link (`os.link`), preventing overwrite races and failing closed with `StorageUnsupportedFilesystemError` on filesystems without hard-link support. If an error occurs mid-stream, partial files are immediately purged and `StorageWriteError` is raised.
 - **Safe Directory Pruning:** Deletion of the last file in a partition automatically cleans up empty parent directories up to the storage root.
 
 ### Storage Security Guarantees
@@ -380,4 +390,15 @@ The platform incorporates a decoupled, production-grade file storage architectur
 
 ### Deferred Risks & Limitations
 - **Rate Limiting:** Distributed rate limiting (e.g. Redis-backed token bucket) is deferred. The application currently relies on upstream reverse proxies (NGINX, Cloudflare, AWS WAF) for volumetric DDoS and brute-force throttling on `/login`, `/register`, and `/password-reset/request`.
-- **Background Worker Queue:** Transaction commits occur before SMTP dispatch, with async non-blocking I/O via `asyncio.to_thread`. A dedicated distributed message queue (e.g. Celery / ARQ / RabbitMQ) is planned for Phase 3.
+- **Background Worker Queue:** Transaction commits occur before SMTP dispatch, with async non-blocking I/O via `asyncio.to_thread`. A dedicated distributed message queue (e.g. Celery / ARQ / RabbitMQ) is planned for Phase 4 (OCR processing pipelines).
+
+---
+
+## Phase 3 Roadmap & Scope Boundaries
+
+Phase 3 establishes the document storage and management subsystem across distinct sub-phases:
+- **Phase 3.1 — Storage Architecture & Local Filesystem Foundation (Completed)**: Decoupled `StorageBackend` abstraction, `LocalStorage` backend with two-level prefix partitioning, atomic hard-link publication (`os.link`), bounded-memory streaming, and path traversal security.
+- **Phase 3.2 — Document Data Model & Database Integrity (Completed)**: SQLAlchemy `Document` model, PostgreSQL integrity constraints, composite index `(user_id, created_at)`, user deletion protection (`ON DELETE RESTRICT`, `passive_deletes="all"`), and Alembic migration `0010_create_documents_table`.
+- **Phase 3.3 — Secure Document Upload (Completed)**: Streaming upload endpoints (`POST /api/v1/documents`), magic-byte MIME validation (PDF, JPEG, PNG, TIFF, WebP), file size quota enforcement (`MAX_UPLOAD_SIZE_BYTES`), transactional PostgreSQL persistence, and automatic storage cleanup compensation upon database commit failure.
+- **Phase 3.4 — Document Listing & Management (Next)**: Metadata listing (`GET /api/v1/documents`), single document lookup (`GET /api/v1/documents/{id}`), pagination, and ownership verification.
+- **Phase 3.5 — Secure Download & Coordinated Deletion**: Streaming download endpoints (`GET /api/v1/documents/{id}/download`), Range headers, and coordinated two-phase deletion (atomic physical file unlink via `StorageBackend` followed by database metadata record removal).

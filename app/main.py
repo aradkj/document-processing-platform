@@ -62,6 +62,13 @@ OPENAPI_TAGS = [
         ),
     },
     {
+        "name": "Documents",
+        "description": (
+            "Secure document upload, content-signature validation, bounded-memory streaming, "
+            "and PostgreSQL metadata persistence."
+        ),
+    },
+    {
         "name": "Health",
         "description": "Operational health probes for service liveness and database readiness.",
     },

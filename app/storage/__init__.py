@@ -1,7 +1,7 @@
 """Storage package initialization and public interface."""
 
 from functools import lru_cache
-from typing import cast
+from typing import Any, cast
 
 from fastapi import Request
 
@@ -46,7 +46,10 @@ def clear_storage_cache() -> None:
     get_default_storage.cache_clear()
 
 
-def get_storage(request: Request | None = None) -> StorageBackend:
+_DEFAULT_REQUEST: Any = None
+
+
+def get_storage(request: Request = _DEFAULT_REQUEST) -> StorageBackend:
     """Resolve active storage backend from FastAPI application state or fallback to default."""
     if request is not None and hasattr(request.app.state, "storage"):
         return cast(StorageBackend, request.app.state.storage)

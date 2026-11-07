@@ -146,6 +146,7 @@ def test_user_document_relationship_configuration() -> None:
     user_docs_rel = user_mapper.relationships["documents"]
     assert user_docs_rel.lazy == "raise"
     assert user_docs_rel.back_populates == "user"
+    assert user_docs_rel.passive_deletes == "all"
     assert not user_docs_rel.cascade.delete
     assert not user_docs_rel.cascade.delete_orphan
 

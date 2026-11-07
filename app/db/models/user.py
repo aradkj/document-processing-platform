@@ -110,7 +110,7 @@ class User(Base):
     documents: Mapped[list["Document"]] = relationship(
         "Document",
         back_populates="user",
-        passive_deletes=True,
+        passive_deletes="all",
         lazy="raise",
     )
 

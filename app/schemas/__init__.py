@@ -18,8 +18,10 @@ from app.schemas.auth import (
     VerifyEmailRequest,
     VerifyEmailResponse,
 )
+from app.schemas.document import DocumentResponse
 
 __all__ = [
+    "DocumentResponse",
     "LogoutResponse",
     "PasswordResetConfirmRequest",
     "PasswordResetConfirmResponse",

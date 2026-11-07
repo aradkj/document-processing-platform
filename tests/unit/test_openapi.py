@@ -23,11 +23,12 @@ def test_openapi_schema_generation_and_metadata() -> None:
     # Verify tags metadata
     tag_names = {tag["name"] for tag in schema.get("tags", [])}
     assert "Authentication" in tag_names
+    assert "Documents" in tag_names
     assert "Health" in tag_names
 
 
 def test_openapi_all_routes_registered() -> None:
-    """Verify that all Phase 2 authentication and health routes are registered in OpenAPI paths."""
+    """Verify that all Phase 2 and Phase 3 routes are registered in OpenAPI paths."""
     app = create_application()
     schema = app.openapi()
     paths = schema["paths"]
@@ -45,6 +46,7 @@ def test_openapi_all_routes_registered() -> None:
         ("/api/v1/auth/resend-verification", "post"),
         ("/api/v1/auth/password-reset/request", "post"),
         ("/api/v1/auth/password-reset/confirm", "post"),
+        ("/api/v1/documents", "post"),
     ]
 
     for route_path, method in expected_routes:
@@ -71,6 +73,7 @@ def test_openapi_security_requirements() -> None:
         ("/api/v1/auth/me", "get"),
         ("/api/v1/auth/me", "patch"),
         ("/api/v1/auth/resend-verification", "post"),
+        ("/api/v1/documents", "post"),
     ]
     for route_path, method in protected_ops:
         op = paths[route_path][method]

@@ -1,0 +1,296 @@
+"""Unit tests for document upload service streaming, size limits, and compensation."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import uuid
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from fastapi import UploadFile
+
+from app.db.models.user import User
+from app.services.document import (
+    DocumentPersistenceError,
+    DocumentStorageError,
+    UploadSizeExceededError,
+    upload_document,
+)
+from app.services.document_validation import EmptyFileError, ExtensionMismatchError
+from app.storage.base import StorageBackend
+from app.storage.exceptions import StorageWriteError
+from app.storage.types import StoredObject
+
+
+@pytest.fixture
+def mock_user() -> User:
+    """Fixture providing a mock authenticated User."""
+    user = MagicMock(spec=User)
+    user.id = uuid.uuid4()
+    return user
+
+
+@pytest.fixture
+def mock_storage() -> MagicMock:
+    """Fixture providing a mock StorageBackend."""
+    storage = MagicMock(spec=StorageBackend)
+    storage.generate_key.return_value = "a" * 32
+    return storage
+
+
+@pytest.fixture
+def mock_session() -> AsyncMock:
+    """Fixture providing a mock AsyncSession."""
+    session = AsyncMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    session.refresh = AsyncMock()
+    session.add = MagicMock()
+    return session
+
+
+@pytest.mark.asyncio
+async def test_upload_document_success(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify successful upload stream, storage persistence, and document creation."""
+    pdf_content = b"%PDF-1.7\r\nTest content for document service upload testing."
+    expected_sha256 = hashlib.sha256(pdf_content).hexdigest()
+    file_obj = UploadFile(
+        file=io.BytesIO(pdf_content),
+        filename="test_document.pdf",
+    )
+
+    mock_storage.save = AsyncMock(
+        return_value=StoredObject(
+            storage_key="a" * 32,
+            size_bytes=len(pdf_content),
+            checksum_sha256=expected_sha256,
+            created_at=MagicMock(),
+        )
+    )
+
+    doc = await upload_document(
+        file=file_obj,
+        user=mock_user,
+        session=mock_session,
+        storage=mock_storage,
+        max_upload_size=1048576,
+        chunk_size=1024,
+    )
+
+    assert doc.original_filename == "test_document.pdf"
+    assert doc.content_type == "application/pdf"
+    assert doc.size_bytes == len(pdf_content)
+    assert doc.sha256 == expected_sha256
+    assert doc.user_id == mock_user.id
+    assert doc.storage_key == "a" * 32
+
+    mock_session.add.assert_called_once()
+    mock_session.commit.assert_called_once()
+    mock_session.refresh.assert_called_once_with(doc)
+
+
+@pytest.mark.asyncio
+async def test_upload_document_empty_file_rejected(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify zero-byte upload is rejected before writing to storage."""
+    file_obj = UploadFile(
+        file=io.BytesIO(b""),
+        filename="empty.pdf",
+    )
+
+    with pytest.raises(EmptyFileError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_storage.save.assert_not_called()
+    mock_session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_document_size_exceeded_in_initial_header(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify upload exceeding maximum size in initial header chunk is rejected immediately."""
+    pdf_content = b"%PDF-1.7\r\n" + b"x" * 200
+    file_obj = UploadFile(
+        file=io.BytesIO(pdf_content),
+        filename="large.pdf",
+    )
+
+    # Set max size smaller than header
+    with pytest.raises(UploadSizeExceededError) as exc_info:
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=50,  # 50 bytes max limit
+            chunk_size=1024,
+        )
+
+    assert "exceeds maximum allowed upload size" in str(exc_info.value)
+    mock_storage.save.assert_not_called()
+    mock_session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_document_size_exceeded_during_streaming(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify stream is aborted during chunk iteration when size limit is crossed."""
+    header = b"%PDF-1.7\r\n"
+    body_chunks = [b"a" * 100, b"b" * 100, b"c" * 100]
+    full_content = header + b"".join(body_chunks)
+
+    file_obj = UploadFile(
+        file=io.BytesIO(full_content),
+        filename="stream_limit.pdf",
+    )
+
+    # Implement real consumption in mock_storage.save
+    async def fake_save(
+        stream: Any,
+        *,
+        storage_key: str | None = None,
+    ) -> StoredObject:
+        async for _chunk in stream:
+            pass
+        return StoredObject(
+            storage_key="a" * 32,
+            size_bytes=len(full_content),
+            checksum_sha256="abc",
+            created_at=MagicMock(),
+        )
+
+    mock_storage.save = AsyncMock(side_effect=fake_save)
+
+    # Set max limit to 150 bytes (header + chunk 1 is ~110 bytes, chunk 2 crosses 210 bytes)
+    with pytest.raises(UploadSizeExceededError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=150,
+            chunk_size=100,
+        )
+
+    mock_session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_document_extension_mismatch_rejected(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify extension mismatch raises ExtensionMismatchError before saving to storage."""
+    # PNG content disguised as .pdf
+    png_content = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR..."
+    file_obj = UploadFile(
+        file=io.BytesIO(png_content),
+        filename="fake.pdf",
+    )
+
+    with pytest.raises(ExtensionMismatchError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_storage.save.assert_not_called()
+    mock_session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_document_storage_error_mapping(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify StorageError during save is wrapped as DocumentStorageError."""
+    pdf_content = b"%PDF-1.7\r\nValid PDF"
+    file_obj = UploadFile(
+        file=io.BytesIO(pdf_content),
+        filename="valid.pdf",
+    )
+
+    mock_storage.save = AsyncMock(side_effect=StorageWriteError("Disk full"))
+
+    with pytest.raises(DocumentStorageError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_document_database_failure_triggers_compensation(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify that if database commit fails, the stored object is deleted for compensation."""
+    pdf_content = b"%PDF-1.7\r\nValid PDF content"
+    file_obj = UploadFile(
+        file=io.BytesIO(pdf_content),
+        filename="compensation.pdf",
+    )
+
+    target_key = "b" * 32
+    mock_storage.save = AsyncMock(
+        return_value=StoredObject(
+            storage_key=target_key,
+            size_bytes=len(pdf_content),
+            checksum_sha256="fake_sha256",
+            created_at=MagicMock(),
+        )
+    )
+    mock_storage.delete = AsyncMock(return_value=True)
+
+    # Simulate database commit failure (e.g. database disconnect)
+    mock_session.commit.side_effect = RuntimeError("Database connection terminated")
+
+    with pytest.raises(DocumentPersistenceError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    # Verify rollback was called on database session
+    mock_session.rollback.assert_called_once()
+    # Verify compensation deletion was triggered on storage with exact storage_key
+    mock_storage.delete.assert_called_once_with(target_key, missing_ok=True)

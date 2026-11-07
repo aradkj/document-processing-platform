@@ -440,11 +440,173 @@ async def test_foreign_key_rejects_nonexistent_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_user_deletion_restricted_when_documents_exist(sample_user: User) -> None:
-    """Verify ON DELETE RESTRICT prevents deleting a User who owns documents.
+async def test_check_constraint_size_bytes_zero_accepted(sample_user: User) -> None:
+    """Verify PostgreSQL check constraint accepts zero-size documents (e.g. empty files)."""
+    if not await is_postgres_available():
+        pytest.skip("PostgreSQL is not reachable.")
 
-    This ensures physical files on StorageBackend are never orphaned by silent
-    database cascades when a User is deleted.
+    session_gen = get_db_session()
+    session = await anext(session_gen)
+    storage_key = secrets.token_hex(16)
+    empty_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    try:
+        doc = Document(
+            user_id=sample_user.id,
+            storage_key=storage_key,
+            original_filename="empty.txt",
+            content_type="text/plain",
+            size_bytes=0,
+            sha256=empty_sha256,
+        )
+        session.add(doc)
+        await session.commit()
+        await session.refresh(doc)
+
+        assert doc.size_bytes == 0
+
+        # Cleanup
+        await session.delete(doc)
+        await session.commit()
+    finally:
+        user_to_del = await session.get(User, sample_user.id)
+        if user_to_del:
+            await session.delete(user_to_del)
+            await session.commit()
+        try:
+            await anext(session_gen)
+        except StopAsyncIteration:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "null_column",
+    [
+        "user_id",
+        "storage_key",
+        "original_filename",
+        "content_type",
+        "size_bytes",
+        "sha256",
+    ],
+)
+async def test_required_fields_reject_null(sample_user: User, null_column: str) -> None:
+    """Verify PostgreSQL rejects NULL values for every required Document column."""
+    if not await is_postgres_available():
+        pytest.skip("PostgreSQL is not reachable.")
+
+    session_gen = get_db_session()
+    session = await anext(session_gen)
+
+    # Base valid parameters
+    doc_params = {
+        "id": uuid.uuid4(),
+        "user_id": sample_user.id,
+        "storage_key": secrets.token_hex(16),
+        "original_filename": "test.pdf",
+        "content_type": "application/pdf",
+        "size_bytes": 1024,
+        "sha256": "a" * 64,
+    }
+    # Set the target column to NULL
+    doc_params[null_column] = None
+
+    try:
+        stmt = text(
+            "INSERT INTO documents "
+            "(id, user_id, storage_key, original_filename, "
+            "content_type, size_bytes, sha256) "
+            "VALUES (:id, :user_id, :storage_key, :original_filename, "
+            ":content_type, :size_bytes, :sha256);"
+        )
+        with pytest.raises(IntegrityError) as exc_info:
+            await session.execute(stmt, doc_params)
+            await session.commit()
+
+        err_text = str(exc_info.value).lower()
+        assert "not-null constraint" in err_text or "null value" in err_text
+        await session.rollback()
+    finally:
+        user_to_del = await session.get(User, sample_user.id)
+        if user_to_del:
+            await session.delete(user_to_del)
+            await session.commit()
+        try:
+            await anext(session_gen)
+        except StopAsyncIteration:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_user_deletion_scenario_a_unloaded_documents(sample_user: User) -> None:
+    """Scenario A: Verify deletion restriction when documents relationship is not loaded."""
+    if not await is_postgres_available():
+        pytest.skip("PostgreSQL is not reachable.")
+
+    session_gen = get_db_session()
+    session = await anext(session_gen)
+
+    try:
+        user_id = sample_user.id
+        doc_id = uuid.uuid4()
+        storage_key = secrets.token_hex(16)
+        doc = Document(
+            id=doc_id,
+            user_id=user_id,
+            storage_key=storage_key,
+            original_filename="scenario_a.pdf",
+            content_type="application/pdf",
+            size_bytes=1024,
+            sha256="1" * 64,
+        )
+        session.add(doc)
+        await session.commit()
+
+        # In a separate transaction context, load User without accessing user.documents
+        user_to_delete = await session.get(User, user_id)
+        assert user_to_delete is not None
+        await session.delete(user_to_delete)
+
+        with pytest.raises(IntegrityError) as exc_info:
+            await session.commit()
+
+        # PostgreSQL rejects deletion due to RESTRICT foreign key
+        err_msg = str(exc_info.value).lower()
+        assert (
+            "fk_documents_user_id_users" in err_msg or "violates foreign key constraint" in err_msg
+        )
+        await session.rollback()
+
+        # Verify Document metadata and ownership are intact
+        res = await session.execute(select(Document).where(Document.id == doc_id))
+        persisted_doc = res.scalar_one()
+        assert persisted_doc.user_id == user_id
+        assert persisted_doc.storage_key == storage_key
+
+        # Explicitly delete document first
+        await session.delete(persisted_doc)
+        await session.commit()
+
+        # User deletion now succeeds
+        user_to_delete = await session.get(User, user_id)
+        assert user_to_delete is not None
+        await session.delete(user_to_delete)
+        await session.commit()
+        assert await session.get(User, user_id) is None
+    finally:
+        try:
+            await anext(session_gen)
+        except StopAsyncIteration:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_user_deletion_scenario_b_loaded_documents(sample_user: User) -> None:
+    """Scenario B: Verify deletion restriction when documents relationship is explicitly loaded.
+
+    passive_deletes='all' guarantees the ORM will NOT attempt to nullify user_id on
+    loaded documents in memory, deferring directly to PostgreSQL's ON DELETE RESTRICT.
     """
     if not await is_postgres_available():
         pytest.skip("PostgreSQL is not reachable.")
@@ -455,48 +617,151 @@ async def test_user_deletion_restricted_when_documents_exist(sample_user: User) 
     try:
         user_id = sample_user.id
         doc_id = uuid.uuid4()
-        # Create a document owned by sample_user
+        storage_key = secrets.token_hex(16)
         doc = Document(
             id=doc_id,
             user_id=user_id,
-            storage_key=secrets.token_hex(16),
-            original_filename="important_document.pdf",
+            storage_key=storage_key,
+            original_filename="scenario_b.pdf",
             content_type="application/pdf",
             size_bytes=2048,
-            sha256="6" * 64,
+            sha256="2" * 64,
         )
         session.add(doc)
         await session.commit()
 
-        # Attempt to delete the User while owned documents exist
-        user_to_delete = await session.get(User, user_id)
-        assert user_to_delete is not None
-        await session.delete(user_to_delete)
+        # Explicitly load User with documents in memory
+        stmt = select(User).where(User.id == user_id).options(selectinload(User.documents))
+        res = await session.execute(stmt)
+        loaded_user = res.scalar_one()
+        assert len(loaded_user.documents) == 1
+
+        # Attempt to delete the loaded user
+        await session.delete(loaded_user)
 
         with pytest.raises(IntegrityError) as exc_info:
             await session.commit()
 
-        # PostgreSQL must reject deletion due to RESTRICT foreign key
         err_msg = str(exc_info.value).lower()
-        is_fk_err = (
+        assert (
             "fk_documents_user_id_users" in err_msg or "violates foreign key constraint" in err_msg
         )
-        assert is_fk_err
         await session.rollback()
 
-        # Now explicitly delete the document first
-        doc_to_delete = await session.get(Document, doc_id)
-        assert doc_to_delete is not None
-        await session.delete(doc_to_delete)
+        # Verify Document was not modified or nullified
+        doc_res = await session.execute(select(Document).where(Document.id == doc_id))
+        persisted_doc: Document = doc_res.scalar_one()
+        assert persisted_doc.user_id == user_id
+        assert persisted_doc.user_id is not None
+
+        # Cleanup
+        await session.delete(persisted_doc)
         await session.commit()
 
-        # User deletion must now succeed cleanly
+        user_to_delete = await session.get(User, user_id)
+        if user_to_delete:
+            await session.delete(user_to_delete)
+            await session.commit()
+    finally:
+        try:
+            await anext(session_gen)
+        except StopAsyncIteration:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_user_deletion_scenario_c_independently_loaded_documents(sample_user: User) -> None:
+    """Scenario C: Verify deletion restriction when Documents are independently queried."""
+    if not await is_postgres_available():
+        pytest.skip("PostgreSQL is not reachable.")
+
+    session_gen = get_db_session()
+    session = await anext(session_gen)
+
+    try:
+        user_id = sample_user.id
+        doc_id = uuid.uuid4()
+        storage_key = secrets.token_hex(16)
+        doc = Document(
+            id=doc_id,
+            user_id=user_id,
+            storage_key=storage_key,
+            original_filename="scenario_c.pdf",
+            content_type="application/pdf",
+            size_bytes=4096,
+            sha256="3" * 64,
+        )
+        session.add(doc)
+        await session.commit()
+
+        # Independently query document into session identity map
+        doc_res = await session.execute(select(Document).where(Document.id == doc_id))
+        loaded_doc = doc_res.scalar_one()
+        assert loaded_doc is not None
+
+        # Query user into same session
+        user_res = await session.execute(select(User).where(User.id == user_id))
+        user_obj = user_res.scalar_one()
+
+        # Delete user
+        await session.delete(user_obj)
+        with pytest.raises(IntegrityError) as exc_info:
+            await session.commit()
+
+        err_msg = str(exc_info.value).lower()
+        assert (
+            "fk_documents_user_id_users" in err_msg or "violates foreign key constraint" in err_msg
+        )
+        await session.rollback()
+
+        # Verify Document remains intact
+        check_res = await session.execute(select(Document).where(Document.id == doc_id))
+        still_doc = check_res.scalar_one()
+        assert still_doc.user_id == user_id
+
+        # Cleanup
+        await session.delete(still_doc)
+        await session.commit()
+
+        user_to_delete = await session.get(User, user_id)
+        if user_to_delete:
+            await session.delete(user_to_delete)
+            await session.commit()
+    finally:
+        try:
+            await anext(session_gen)
+        except StopAsyncIteration:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_user_deletion_scenario_d_user_without_documents() -> None:
+    """Scenario D: Verify that a User without Documents can be deleted normally."""
+    if not await is_postgres_available():
+        pytest.skip("PostgreSQL is not reachable.")
+
+    session_gen = get_db_session()
+    session = await anext(session_gen)
+
+    # Create isolated user with no documents
+    user = User(
+        email=f"scenario_d_{secrets.token_hex(4)}@example.com",
+        username=f"scenario_d_{secrets.token_hex(4)}",
+        password_hash="mock_hash_scenario_d",
+        is_active=True,
+    )
+    session.add(user)
+    await session.commit()
+    user_id = user.id
+
+    try:
+        # Delete user with no documents
         user_to_delete = await session.get(User, user_id)
         assert user_to_delete is not None
         await session.delete(user_to_delete)
         await session.commit()
 
-        # Verify user is gone
+        # Verify user is cleanly deleted
         assert await session.get(User, user_id) is None
     finally:
         try:

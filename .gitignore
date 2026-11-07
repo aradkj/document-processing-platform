@@ -48,3 +48,7 @@ coverage.xml
 *~
 .DS_Store
 Thumbs.db
+
+# Storage
+storage_data/
+storage_data_*/

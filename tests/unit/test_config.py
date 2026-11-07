@@ -24,6 +24,7 @@ def test_default_settings() -> None:
         assert settings.DB_MAX_OVERFLOW == 20
         assert settings.DB_POOL_TIMEOUT == 30.0
         assert settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS == 7
+        assert settings.MAX_UPLOAD_SIZE_BYTES == 20971520
 
 
 def test_environment_override() -> None:
@@ -39,6 +40,7 @@ def test_environment_override() -> None:
         "DB_MAX_OVERFLOW": "25",
         "DB_POOL_TIMEOUT": "45.0",
         "JWT_REFRESH_TOKEN_EXPIRE_DAYS": "14",
+        "MAX_UPLOAD_SIZE_BYTES": "10485760",
     }
     with patch.dict(os.environ, test_env, clear=True):
         custom_settings = Settings(_env_file=None)
@@ -52,6 +54,7 @@ def test_environment_override() -> None:
         assert custom_settings.DB_MAX_OVERFLOW == 25
         assert custom_settings.DB_POOL_TIMEOUT == 45.0
         assert custom_settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS == 14
+        assert custom_settings.MAX_UPLOAD_SIZE_BYTES == 10485760
         assert custom_settings.is_production is False
         assert custom_settings.is_testing is False
 
