@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from datetime import datetime
+from typing import Any
 
 from fastapi import UploadFile
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
 
 from app.db.models.document import Document
 from app.db.models.user import User
@@ -19,6 +24,7 @@ from app.services.document_validation import (
 )
 from app.storage.base import StorageBackend
 from app.storage.exceptions import StorageError
+from app.storage.types import StoredObject
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +62,16 @@ async def upload_document(
     - Opaque storage keys generated via StorageBackend.
     - Owner identity derived strictly from authenticated user.
     - Atomic storage compensation (deleting stored file if database commit fails).
+    - Cancellation-safe compensation preventing orphaned storage files.
     - Deterministic file descriptor closing.
     """
-    try:
-        user_id = user.id
+    stored_obj: StoredObject | None = None
+    commit_attempted = False
+    committed = False
+    doc_id: uuid.UUID | None = None
+    user_id = user.id
 
+    try:
         # 1. Validate and normalize user-provided original filename
         normalized_filename = validate_and_sanitize_filename(file.filename)
 
@@ -108,12 +119,16 @@ async def upload_document(
             # Re-raise size limit exceptions directly
             raise
         except StorageError as exc:
+            # Check if this was caused by an UploadSizeExceededError from the stream
+            if isinstance(exc.__cause__, UploadSizeExceededError):
+                raise exc.__cause__ from None
             logger.error("Failed persisting file to storage backend: %s", exc)
             raise DocumentStorageError("Failed to persist file in storage backend.") from exc
 
         # 6. Persist metadata record in PostgreSQL within transactional boundary
+        doc_id = uuid.uuid4()
         doc = Document(
-            id=uuid.uuid4(),
+            id=doc_id,
             user_id=user_id,
             storage_key=stored_obj.storage_key,
             original_filename=normalized_filename,
@@ -124,8 +139,13 @@ async def upload_document(
         session.add(doc)
 
         try:
+            commit_attempted = True
             await session.commit()
+            committed = True
             await session.refresh(doc)
+        except asyncio.CancelledError:
+            # Cancellation during or after commit will be handled by outer cancellation block
+            raise
         except Exception as db_exc:
             # 7. Database failure compensation: unlink stored physical file
             await session.rollback()
@@ -163,6 +183,185 @@ async def upload_document(
         )
         return doc
 
+    except asyncio.CancelledError as cancel_exc:
+        # Task cancellation occurred
+        if stored_obj is not None and not committed:
+            # A storage object was published, but commit is not known to have succeeded
+            should_delete = False
+            if not commit_attempted:
+                # Commit was never called: transaction definitely did not commit
+                should_delete = True
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+            else:
+                # Commit was attempted and cancelled. Check if PostgreSQL committed the row.
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+
+                try:
+                    res = await session.execute(select(Document.id).where(Document.id == doc_id))
+                    persisted = res.scalar_one_or_none() is not None
+                    if persisted:
+                        logger.warning(
+                            "Cancellation during commit, but document record '%s' was committed. "
+                            "Preserving storage object '%s'.",
+                            doc_id,
+                            stored_obj.storage_key,
+                            extra={"user_id": str(user_id), "storage_key": stored_obj.storage_key},
+                        )
+                        should_delete = False
+                    else:
+                        should_delete = True
+                except Exception as check_exc:
+                    # Outcome uncertain: DO NOT delete storage to avoid corrupting DB doc
+                    logger.critical(
+                        "CRITICAL: Cancellation during commit with uncertain database outcome. "
+                        "Storage key '%s' preserved for reconciliation. Database check error: %s",
+                        stored_obj.storage_key,
+                        check_exc,
+                        extra={"user_id": str(user_id), "storage_key": stored_obj.storage_key},
+                    )
+                    should_delete = False
+
+            if should_delete:
+                target_key = stored_obj.storage_key
+
+                async def _perform_cancellation_cleanup() -> None:
+                    try:
+                        await storage.delete(target_key, missing_ok=True)
+                        logger.info(
+                            "Cancellation cleanup succeeded: deleted orphaned storage object '%s'.",
+                            target_key,
+                            extra={"user_id": str(user_id), "storage_key": target_key},
+                        )
+                    except Exception as cleanup_exc:
+                        logger.critical(
+                            "CRITICAL: Cancellation storage cleanup FAILED! Orphaned key '%s'. "
+                            "Requires reconciliation. Error: %s",
+                            target_key,
+                            cleanup_exc,
+                            extra={"user_id": str(user_id), "storage_key": target_key},
+                        )
+
+                cleanup_task = asyncio.create_task(_perform_cancellation_cleanup())
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    await cleanup_task
+
+        raise cancel_exc
+
     finally:
         # Guarantee input file descriptor cleanup
         await file.close()
+
+
+def escape_like_wildcards(text: str, escape_char: str = "\\") -> str:
+    """Escape SQL LIKE wildcard characters (%, _) and the escape character itself."""
+    return (
+        text.replace(escape_char, escape_char * 2)
+        .replace("%", f"{escape_char}%")
+        .replace("_", f"{escape_char}_")
+    )
+
+
+async def get_document_by_id(
+    session: AsyncSession,
+    *,
+    document_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> Document | None:
+    """Retrieve metadata for a single document owned by user_id.
+
+    Returns None if the document does not exist or belongs to another user.
+    """
+    stmt = select(Document).where(
+        Document.id == document_id,
+        Document.user_id == user_id,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def list_documents(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    limit: int = 20,
+    offset: int = 0,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
+    content_type: str | None = None,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+    q: str | None = None,
+) -> tuple[list[Document], int]:
+    """Query, filter, and paginate documents owned by user_id with deterministic sorting.
+
+    Guarantees:
+    - Strict owner isolation in SQL (Document.user_id == user_id).
+    - Database-level pagination via LIMIT and OFFSET.
+    - Deterministic tie-breaking using Document.id.
+    - Parameterized SQL with wildcard escaping for filename search.
+    - Total count calculated using identical filtering criteria.
+    """
+    conditions = [Document.user_id == user_id]
+
+    if content_type is not None:
+        trimmed_ct = content_type.strip()
+        if trimmed_ct:
+            conditions.append(Document.content_type == trimmed_ct)
+
+    if created_after is not None:
+        conditions.append(Document.created_at >= created_after)
+
+    if created_before is not None:
+        conditions.append(Document.created_at <= created_before)
+
+    if q is not None:
+        trimmed_q = q.strip()
+        if trimmed_q:
+            escaped_q = escape_like_wildcards(trimmed_q)
+            conditions.append(Document.original_filename.ilike(f"%{escaped_q}%", escape="\\"))
+
+    count_stmt = select(func.count()).select_from(Document).where(*conditions)
+    count_res = await session.execute(count_stmt)
+    total = count_res.scalar_one()
+
+    if total == 0:
+        return [], 0
+
+    sort_col: InstrumentedAttribute[Any]
+    if sort_by == "updated_at":
+        sort_col = Document.updated_at
+    elif sort_by == "original_filename":
+        sort_col = Document.original_filename
+    elif sort_by == "size_bytes":
+        sort_col = Document.size_bytes
+    else:
+        sort_col = Document.created_at
+
+    if sort_order == "asc":
+        query_stmt = (
+            select(Document)
+            .where(*conditions)
+            .order_by(sort_col.asc(), Document.id.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+    else:
+        query_stmt = (
+            select(Document)
+            .where(*conditions)
+            .order_by(sort_col.desc(), Document.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+    result = await session.execute(query_stmt)
+    items = list(result.scalars().all())
+
+    return items, total

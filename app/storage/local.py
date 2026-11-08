@@ -494,7 +494,7 @@ class LocalStorage(StorageBackend):
                     raise StoragePermissionError(
                         "Permission denied writing storage object."
                     ) from exc
-                except Exception as exc:
+                except OSError as exc:
                     raise StorageWriteError("Failed to persist storage object to disk.") from exc
                 finally:
                     if not temp_closed:
@@ -597,7 +597,7 @@ class LocalStorage(StorageBackend):
                 raise
             except PermissionError as exc:
                 raise StoragePermissionError("Permission denied writing storage object.") from exc
-            except Exception as exc:
+            except OSError as exc:
                 raise StorageWriteError("Failed to persist storage object to disk.") from exc
             finally:
                 temp_path.unlink(missing_ok=True)

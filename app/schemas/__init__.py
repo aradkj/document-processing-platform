@@ -18,11 +18,12 @@ from app.schemas.auth import (
     VerifyEmailRequest,
     VerifyEmailResponse,
 )
-from app.schemas.document import DocumentResponse
+from app.schemas.document import DocumentResponse, PaginatedDocumentResponse
 
 __all__ = [
     "DocumentResponse",
     "LogoutResponse",
+    "PaginatedDocumentResponse",
     "PasswordResetConfirmRequest",
     "PasswordResetConfirmResponse",
     "PasswordResetRequest",

@@ -4,14 +4,21 @@ A modern, high-performance, and secure asynchronous backend for the Document Pro
 
 ## Current Phase
 
-**Phase 3.3 — Secure Document Upload (Completed)**
+**Phase 3.4 — Document Listing, Search, Filtering & Metadata Management (Completed)**
 
-The platform provides a production-grade authentication engine (Phase 2), a decoupled storage abstraction (Phase 3.1), a robust document metadata database foundation (Phase 3.2), and a hardened document upload subsystem (Phase 3.3):
+The platform provides a production-grade authentication engine (Phase 2), a decoupled storage abstraction (Phase 3.1), a robust document metadata database foundation (Phase 3.2), a hardened document upload subsystem (Phase 3.3), and a comprehensive document discovery and metadata management engine (Phase 3.4):
+- **Authenticated Document Listing:** `GET /api/v1/documents` endpoint enforcing strict JWT Bearer authentication, querying PostgreSQL with SQL-level owner isolation (`Document.user_id == current_user.id`) to guarantee tenants can never view foreign records.
+- **SQL-Level Pagination:** Configurable `limit` (default 20, range 1–100) and `offset` (default 0, ge 0) applied directly in PostgreSQL queries via `LIMIT` and `OFFSET`, paired with an exact count query matching identical filter conditions.
+- **Deterministic Multi-Column Sorting:** Controlled sorting by `created_at`, `updated_at`, `original_filename`, or `size_bytes` in either `asc` or `desc` order, stabilized by a secondary tie-breaker on document UUID (`Document.id`) to prevent pagination jitter.
+- **Precise Metadata Filtering:** Exact content-type filtering (`content_type`), ISO 8601 timezone-aware creation date boundaries (`created_after`, `created_before`) with chronological validation, and zero naive-datetime leakage.
+- **Safe Substring Filename Search (`q`):** Parameterized case-insensitive substring search (`ILIKE`) with automatic escaping of SQL LIKE wildcard metacharacters (`%`, `_`, and `\`), preventing SQL injection and pattern manipulation.
+- **Single Document Metadata Retrieval:** `GET /api/v1/documents/{document_id}` endpoint validating UUID paths, querying exclusively within the caller's ownership scope, and returning uniform HTTP 404 responses for nonexistent and cross-user IDs alike (anti-enumeration / IDOR defense).
+- **Zero Storage Leakage:** Listing and detail queries execute purely against PostgreSQL metadata without opening file descriptors, reading storage bytes, or exposing internal `storage_key` values or server directory structures.
 - **Authenticated Secure Document Upload:** `POST /api/v1/documents` endpoint enforcing JWT Bearer authentication, accepting multipart form uploads under the `file` field with strict client-tamper protection (`user_id` derived exclusively from server authentication context).
 - **Strict Filename Validation & Normalization:** Unicode NFC normalization, null byte (`\0`, `%00`), path separator (`/`, `\\`), colon (`:`), traversal (`..`), control character, and length boundary (1–255 chars) validation. Missing stems or extensions are rejected.
-- **Content-Type Signature Detection (Magic Bytes):** Trustworthy signature inspection for PDF (`%PDF-`), JPEG (`\xFF\xD8\xFF`), PNG (`\x89PNG\r\n\x1a\n`), TIFF (`II*\x00` and `MM\x00*`), and WebP (`RIFF...WEBP`). Spoofing prevention via strict extension-to-signature cross-validation.
-- **Bounded-Memory Streaming & Quota Enforcement:** Asynchronous generator streaming in chunks (default 1MB buffer) directly to `StorageBackend` without buffering entire payloads in memory; configurable size quota via `MAX_UPLOAD_SIZE_BYTES` (default 20MB) with early stream termination and incremental SHA-256 calculation.
-- **Transactional Consistency & Storage Compensation:** Persistence to PostgreSQL `documents` table tied to authenticated `user.id`. If database persistence or transaction commit fails, two-phase compensation triggers an immediate physical unlink via `storage.delete(storage_key, missing_ok=True)` to prevent orphaned files.
+- **Content-Type Signature Detection (Magic Bytes):** Initial byte signature identification for PDF (`%PDF-`), JPEG (`\xFF\xD8\xFF`), PNG (`\x89PNG\r\n\x1a\n`), TIFF (`II*\x00` and `MM\x00*`), and WebP (`RIFF...WEBP`), cross-validated against allowed filename extensions to prevent naive extension spoofing. Magic-byte checks identify formats by header signature but do not perform deep structural parsing, decompression, or malware/antivirus scanning (deferred to Phase 4 OCR processing).
+- **Bounded-Memory Streaming & Quota Enforcement:** Asynchronous generator streaming in chunks (default 1MB buffer) directly to `StorageBackend` without buffering entire payloads in memory; configurable size quota via `MAX_UPLOAD_SIZE_BYTES` (default 20MB) with early stream termination, consistent HTTP 413 error mapping across all chunk boundaries, and incremental SHA-256 calculation.
+- **Cancellation-Safe Consistency & Storage Compensation:** Persistence to PostgreSQL `documents` table tied to authenticated `user.id`. In the event of database transaction failure or task cancellation, two-phase compensation triggers an immediate physical unlink via `storage.delete(storage_key, missing_ok=True)` to prevent orphaned files, while verifying database state to ensure committed records are never severed from their storage objects.
 - **Document Domain Model:** Full SQLAlchemy `Document` model tracking logical identity, owner reference, opaque storage key, display filename, content type, 64-bit size, and SHA-256 checksum.
 - **Database-Level Integrity Constraints:** Native PostgreSQL check constraints validating 32-character lowercase hex storage keys, 64-character SHA-256 checksums, and non-negative file sizing.
 - **Optimized B-tree Indexing:** Composite index `(user_id, created_at)` optimizing owner queries and ordered pagination without duplicate standalone index overhead.
@@ -22,7 +29,7 @@ The platform provides a production-grade authentication engine (Phase 2), a deco
 - **Atomic File Writes & Cleanup:** Temporary staging writes with automatic rollback/cleanup on stream failures; atomic publication via hard link (`os.link`) with fail-closed protection on unsupported filesystems.
 - **Full Authentication System:** Case-insensitive identity, Argon2id hashing, dual-token JWT, refresh token rotation & reuse detection, email verification, and password reset.
 
-*Note: Document listing, detail lookup, download, deletion, OCR processing pipelines, async workers, search, and AI features belong to subsequent Phase 3 and Phase 4 sub-phases (starting with Phase 3.4).*
+*Note: Document download, deletion, OCR processing pipelines, async workers, and AI features belong to subsequent Phase 3 and Phase 4 sub-phases (starting with Phase 3.5).*
 
 ---
 
@@ -287,7 +294,7 @@ ruff format --check .
 # 3. Run Mypy strict type checking
 mypy app tests
 
-# 4. Run full test suite (520 tests: 512 passed, 8 skipped on Windows)
+# 4. Run full test suite (533 tests: 525 passed, 8 skipped on Windows)
 pytest -v
 
 # 5. Run unit tests only
@@ -387,6 +394,7 @@ The platform incorporates a decoupled, production-grade file storage architectur
 5. **Anti-Enumeration:** Uniform 200 OK responses with generic text for password reset requests whether an email exists, is inactive, or is nonexistent. Constant-time dummy Argon2id hashing prevents timing oracle attacks.
 6. **Concurrent Safety:** All token state mutations use PostgreSQL `SELECT ... FOR UPDATE` row locks to prevent race conditions during token consumption and resend requests.
 7. **Production Guardrails:** `Settings` strictly blocks startup if `DEBUG=True`, default dev database URLs, default JWT secrets, unencrypted authenticated SMTP, or localhost frontend URLs are used in `production`.
+8. **File Signature Identification & Allowlist:** Magic byte inspection prevents basic extension masquerading (e.g. executable `MZ` or HTML scripts renamed to `.pdf` or `.png`) by validating initial header bytes against an allowlist. It does not perform deep file structure parsing, semantic validation, or antivirus/malware scanning. Protection against malicious or polyglot files embedded within valid formats is deferred to the Phase 4 processing and parsing pipeline.
 
 ### Deferred Risks & Limitations
 - **Rate Limiting:** Distributed rate limiting (e.g. Redis-backed token bucket) is deferred. The application currently relies on upstream reverse proxies (NGINX, Cloudflare, AWS WAF) for volumetric DDoS and brute-force throttling on `/login`, `/register`, and `/password-reset/request`.

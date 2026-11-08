@@ -47,3 +47,35 @@ class DocumentResponse(BaseModel):
         extra="forbid",
         from_attributes=True,
     )
+
+
+class PaginatedDocumentResponse(BaseModel):
+    """Paginated list of document metadata records."""
+
+    items: list[DocumentResponse] = Field(
+        ...,
+        description="List of document metadata items matching query criteria",
+    )
+    total: int = Field(
+        ...,
+        ge=0,
+        description="Total number of documents matching filters before pagination",
+        examples=[42],
+    )
+    limit: int = Field(
+        ...,
+        ge=1,
+        le=100,
+        description="Maximum number of items returned in this page",
+        examples=[20],
+    )
+    offset: int = Field(
+        ...,
+        ge=0,
+        description="Zero-based index offset for pagination",
+        examples=[0],
+    )
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )

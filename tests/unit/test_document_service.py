@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import uuid
@@ -294,3 +295,269 @@ async def test_upload_document_database_failure_triggers_compensation(
     mock_session.rollback.assert_called_once()
     # Verify compensation deletion was triggered on storage with exact storage_key
     mock_storage.delete.assert_called_once_with(target_key, missing_ok=True)
+
+
+# ===========================================================================
+# Cancellation Safety Tests
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_upload_cancellation_before_storage_write(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify cancellation before storage writing cleans up file and does not call storage."""
+    file_obj = MagicMock(spec=UploadFile)
+    file_obj.filename = "test.pdf"
+    file_obj.read = AsyncMock(side_effect=asyncio.CancelledError("Client disconnected before read"))
+    file_obj.close = AsyncMock()
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_storage.save.assert_not_called()
+    mock_storage.delete.assert_not_called()
+    mock_session.add.assert_not_called()
+    file_obj.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_upload_cancellation_during_streaming(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify cancellation during chunk streaming aborts and guarantees file close."""
+    pdf_content = b"%PDF-1.7\r\n" + b"x" * 2000
+    file_obj = UploadFile(
+        file=io.BytesIO(pdf_content),
+        filename="test.pdf",
+    )
+
+    async def cancelling_save(stream: Any, *, storage_key: str | None = None) -> StoredObject:
+        async for _ in stream:
+            raise asyncio.CancelledError("Client disconnected mid-stream")
+        raise RuntimeError("Unreachable")
+
+    mock_storage.save = AsyncMock(side_effect=cancelling_save)
+    mock_storage.delete = AsyncMock()
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_storage.delete.assert_not_called()
+    mock_session.add.assert_not_called()
+    assert file_obj.file.closed
+
+
+@pytest.mark.asyncio
+async def test_upload_cancellation_before_commit_triggers_cleanup(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify cancellation after storage publication but before commit deletes storage object."""
+    pdf_content = b"%PDF-1.7\r\nContent"
+    file_obj = UploadFile(file=io.BytesIO(pdf_content), filename="test.pdf")
+
+    target_key = "c" * 32
+    mock_storage.save = AsyncMock(
+        return_value=StoredObject(
+            storage_key=target_key,
+            size_bytes=len(pdf_content),
+            checksum_sha256="abc",
+            created_at=MagicMock(),
+        )
+    )
+    mock_storage.delete = AsyncMock(return_value=True)
+
+    # Simulate cancellation when session.add is called (before commit)
+    mock_session.add.side_effect = asyncio.CancelledError("Client aborted before commit")
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_session.rollback.assert_called_once()
+    mock_storage.delete.assert_called_once_with(target_key, missing_ok=True)
+    assert file_obj.file.closed
+
+
+@pytest.mark.asyncio
+async def test_upload_cancellation_during_commit_uncommitted_triggers_cleanup(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify cancellation during commit when row was not committed unlinks storage object."""
+    pdf_content = b"%PDF-1.7\r\nContent"
+    file_obj = UploadFile(file=io.BytesIO(pdf_content), filename="test.pdf")
+
+    target_key = "d" * 32
+    mock_storage.save = AsyncMock(
+        return_value=StoredObject(
+            storage_key=target_key,
+            size_bytes=len(pdf_content),
+            checksum_sha256="abc",
+            created_at=MagicMock(),
+        )
+    )
+    mock_storage.delete = AsyncMock(return_value=True)
+
+    mock_session.commit.side_effect = asyncio.CancelledError("Cancelled during commit")
+    # Database query check returns None (not committed)
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalar_one_or_none.return_value = None
+    mock_session.execute.return_value = mock_execute_result
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_session.rollback.assert_called_once()
+    mock_storage.delete.assert_called_once_with(target_key, missing_ok=True)
+    assert file_obj.file.closed
+
+
+@pytest.mark.asyncio
+async def test_upload_cancellation_during_commit_already_committed_preserves_storage(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify cancellation during commit when row WAS committed preserves storage object."""
+    pdf_content = b"%PDF-1.7\r\nContent"
+    file_obj = UploadFile(file=io.BytesIO(pdf_content), filename="test.pdf")
+
+    target_key = "e" * 32
+    mock_storage.save = AsyncMock(
+        return_value=StoredObject(
+            storage_key=target_key,
+            size_bytes=len(pdf_content),
+            checksum_sha256="abc",
+            created_at=MagicMock(),
+        )
+    )
+    mock_storage.delete = AsyncMock()
+
+    mock_session.commit.side_effect = asyncio.CancelledError("Cancelled during commit")
+    # Database query check finds the document committed in PostgreSQL
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalar_one_or_none.return_value = uuid.uuid4()
+    mock_session.execute.return_value = mock_execute_result
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    # Must NOT delete storage object because document exists in PostgreSQL!
+    mock_storage.delete.assert_not_called()
+    assert file_obj.file.closed
+
+
+@pytest.mark.asyncio
+async def test_upload_cancellation_after_commit_preserves_storage(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify cancellation after commit (e.g. during refresh) preserves storage object."""
+    pdf_content = b"%PDF-1.7\r\nContent"
+    file_obj = UploadFile(file=io.BytesIO(pdf_content), filename="test.pdf")
+
+    target_key = "f" * 32
+    mock_storage.save = AsyncMock(
+        return_value=StoredObject(
+            storage_key=target_key,
+            size_bytes=len(pdf_content),
+            checksum_sha256="abc",
+            created_at=MagicMock(),
+        )
+    )
+    mock_storage.delete = AsyncMock()
+
+    # Commit succeeds, but refresh is cancelled
+    mock_session.refresh.side_effect = asyncio.CancelledError("Cancelled during refresh")
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_storage.delete.assert_not_called()
+    assert file_obj.file.closed
+
+
+@pytest.mark.asyncio
+async def test_upload_cancellation_cleanup_failure_does_not_mask_cancelled_error(
+    mock_user: User,
+    mock_storage: MagicMock,
+    mock_session: AsyncMock,
+) -> None:
+    """Verify that storage delete failure during cleanup preserves CancelledError."""
+    pdf_content = b"%PDF-1.7\r\nContent"
+    file_obj = UploadFile(file=io.BytesIO(pdf_content), filename="test.pdf")
+
+    target_key = "g" * 32
+    mock_storage.save = AsyncMock(
+        return_value=StoredObject(
+            storage_key=target_key,
+            size_bytes=len(pdf_content),
+            checksum_sha256="abc",
+            created_at=MagicMock(),
+        )
+    )
+    mock_storage.delete = AsyncMock(side_effect=RuntimeError("Storage disk offline"))
+    mock_session.add.side_effect = asyncio.CancelledError("Cancelled before commit")
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload_document(
+            file=file_obj,
+            user=mock_user,
+            session=mock_session,
+            storage=mock_storage,
+            max_upload_size=1048576,
+            chunk_size=1024,
+        )
+
+    mock_storage.delete.assert_called_once_with(target_key, missing_ok=True)
+    assert file_obj.file.closed
