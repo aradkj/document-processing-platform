@@ -13,10 +13,21 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from alembic.config import Config
 from sqlalchemy import text
 
-from app.db.session import get_db_session
+from alembic import command
+from app.core.config import get_settings
+from app.db.session import close_engine, get_engine
 from tests.integration.test_database import is_postgres_available
+
+
+def get_alembic_config() -> Config:
+    """Create an Alembic Config pointing to project configuration."""
+    settings = get_settings()
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+    return cfg
 
 
 @pytest.mark.asyncio
@@ -25,80 +36,61 @@ async def test_migration_lifecycle_upgrade_downgrade_reupgrade() -> None:
     if not await is_postgres_available():
         pytest.skip("PostgreSQL is not reachable.")
 
-    # Ensure we start at head
-    proc_init = await asyncio.create_subprocess_exec(
-        ".venv/Scripts/alembic.exe",
-        "upgrade",
-        "head",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await proc_init.communicate()
+    cfg = get_alembic_config()
 
-    session_gen = get_db_session()
-    session = await anext(session_gen)
+    # Ensure engine closed before Alembic runs
+    await close_engine()
+
+    # Ensure we start at head
+    await asyncio.to_thread(command.upgrade, cfg, "head")
 
     try:
         # 1. Verify column exists in current head (0011)
-        res = await session.execute(
-            text(
-                "SELECT column_name, data_type, is_nullable "
-                "FROM information_schema.columns "
-                "WHERE table_name = 'documents' AND column_name = 'deletion_pending_at'"
+        engine = get_engine()
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT column_name, data_type, is_nullable "
+                    "FROM information_schema.columns "
+                    "WHERE table_name = 'documents' AND column_name = 'deletion_pending_at'"
+                )
             )
-        )
-        col_row = res.fetchone()
-        assert col_row is not None
-        assert col_row[0] == "deletion_pending_at"
-        assert "timestamp" in col_row[1].lower()
-        assert col_row[2] == "YES"
+            col_row = res.fetchone()
+            assert col_row is not None
+            assert col_row[0] == "deletion_pending_at"
+            assert "timestamp" in col_row[1].lower()
+            assert col_row[2] == "YES"
 
         # 2. Test Alembic downgrade to 0010
-        proc_down = await asyncio.create_subprocess_exec(
-            ".venv/Scripts/alembic.exe",
-            "downgrade",
-            "-1",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _stdout, stderr = await proc_down.communicate()
-        assert proc_down.returncode == 0, f"Downgrade failed: {stderr.decode()}"
+        await close_engine()
+        await asyncio.to_thread(command.downgrade, cfg, "-1")
 
         # Verify column is gone in 0010
-        res_down = await session.execute(
-            text(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = 'documents' AND column_name = 'deletion_pending_at'"
+        engine2 = get_engine()
+        async with engine2.connect() as conn2:
+            res_down = await conn2.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'documents' AND column_name = 'deletion_pending_at'"
+                )
             )
-        )
-        assert res_down.fetchone() is None
+            assert res_down.fetchone() is None
 
         # 3. Test Alembic re-upgrade to head (0011)
-        proc_up = await asyncio.create_subprocess_exec(
-            ".venv/Scripts/alembic.exe",
-            "upgrade",
-            "head",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _stdout_up, stderr_up = await proc_up.communicate()
-        assert proc_up.returncode == 0, f"Re-upgrade failed: {stderr_up.decode()}"
+        await close_engine()
+        await asyncio.to_thread(command.upgrade, cfg, "head")
 
         # Verify column exists again
-        res_reup = await session.execute(
-            text(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = 'documents' AND column_name = 'deletion_pending_at'"
+        engine3 = get_engine()
+        async with engine3.connect() as conn3:
+            res_reup = await conn3.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'documents' AND column_name = 'deletion_pending_at'"
+                )
             )
-        )
-        assert res_reup.fetchone() is not None
+            assert res_reup.fetchone() is not None
     finally:
         # Guarantee database remains at head
-        proc_final = await asyncio.create_subprocess_exec(
-            ".venv/Scripts/alembic.exe",
-            "upgrade",
-            "head",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc_final.communicate()
+        await close_engine()
+        await asyncio.to_thread(command.upgrade, cfg, "head")
