@@ -69,6 +69,11 @@ class Document(Base):
         onupdate=func.now(),
         nullable=False,
     )
+    deletion_pending_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
 
     # Relationships (lazy="raise" prevents implicit sync I/O in async context)
     user: Mapped["User"] = relationship(
@@ -89,6 +94,7 @@ class Document(Base):
         sha256: str,
         created_at: datetime | None = None,
         updated_at: datetime | None = None,
+        deletion_pending_at: datetime | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize a Document entity record."""
@@ -106,6 +112,8 @@ class Document(Base):
             self.created_at = created_at
         if updated_at is not None:
             self.updated_at = updated_at
+        if deletion_pending_at is not None:
+            self.deletion_pending_at = deletion_pending_at
 
     def __repr__(self) -> str:
         """Safe representation showing document identity, owner, and storage key."""

@@ -202,6 +202,7 @@ async def test_list_documents_single_and_fields(
 
     # Critical security assertion: storage_key and internal paths must NOT be present
     assert "storage_key" not in item
+    assert "user_id" not in item
     assert "path" not in item
     assert "file_path" not in item
     assert "storage_path" not in item
@@ -299,15 +300,15 @@ async def test_pagination_boundary_values(async_client: AsyncClient, sample_user
 
     # Invalid limit: 0 (< 1) -> 422
     resp_zero = await async_client.get("/api/v1/documents?limit=0", headers=headers)
-    assert resp_zero.status_code in (422, 400)
+    assert resp_zero.status_code == 422
 
     # Invalid limit: 101 (> 100) -> 422
     resp_overflow = await async_client.get("/api/v1/documents?limit=101", headers=headers)
-    assert resp_overflow.status_code in (422, 400)
+    assert resp_overflow.status_code == 422
 
     # Invalid offset: -1 (< 0) -> 422
     resp_neg_offset = await async_client.get("/api/v1/documents?offset=-1", headers=headers)
-    assert resp_neg_offset.status_code in (422, 400)
+    assert resp_neg_offset.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -430,12 +431,12 @@ async def test_sorting_invalid_parameters(async_client: AsyncClient, sample_user
     resp_invalid_field = await async_client.get(
         "/api/v1/documents?sort_by=nonexistent_column", headers=headers
     )
-    assert resp_invalid_field.status_code in (422, 400)
+    assert resp_invalid_field.status_code == 422
 
     resp_invalid_order = await async_client.get(
         "/api/v1/documents?sort_order=sideways", headers=headers
     )
-    assert resp_invalid_order.status_code in (422, 400)
+    assert resp_invalid_order.status_code == 422
 
 
 # =====================================================================
@@ -548,7 +549,7 @@ async def test_filter_date_validation_errors(async_client: AsyncClient, sample_u
     resp_naive = await async_client.get(
         "/api/v1/documents?created_after=2026-03-15T00:00:00", headers=headers
     )
-    assert resp_naive.status_code in (422, 400)
+    assert resp_naive.status_code == 422
     assert "timezone" in resp_naive.json()["detail"].lower()
 
     # Contradictory range: created_after > created_before
@@ -556,7 +557,7 @@ async def test_filter_date_validation_errors(async_client: AsyncClient, sample_u
         "/api/v1/documents?created_after=2026-03-25T00:00:00Z&created_before=2026-03-15T00:00:00Z",
         headers=headers,
     )
-    assert resp_contra.status_code in (422, 400)
+    assert resp_contra.status_code == 422
     assert "cannot be later" in resp_contra.json()["detail"].lower()
 
 
@@ -645,7 +646,17 @@ async def test_filter_filename_search_sql_injection_resistance(
     # Excessively long query (> 255 chars) returns 422
     long_q = "a" * 256
     resp_long = await async_client.get(f"/api/v1/documents?q={long_q}", headers=headers)
-    assert resp_long.status_code in (422, 400)
+    assert resp_long.status_code == 422
+
+    # Null bytes in q (%00) rejected with 422
+    resp_null = await async_client.get("/api/v1/documents?q=invoice%00evil", headers=headers)
+    assert resp_null.status_code == 422
+    assert "null bytes" in resp_null.json()["detail"].lower()
+
+    # ASCII control characters in q (%07) rejected with 422
+    resp_ctrl = await async_client.get("/api/v1/documents?q=invoice%07bell", headers=headers)
+    assert resp_ctrl.status_code == 422
+    assert "control characters" in resp_ctrl.json()["detail"].lower()
 
 
 # =====================================================================
@@ -674,6 +685,7 @@ async def test_get_document_detail_success(async_client: AsyncClient, sample_use
     assert data["original_filename"] == "detailed_doc.pdf"
     assert data["size_bytes"] == 5120
     assert "storage_key" not in data
+    assert "user_id" not in data
 
 
 @pytest.mark.asyncio
@@ -703,7 +715,7 @@ async def test_get_document_detail_malformed_uuid(
     headers = get_auth_headers(sample_user)
     resp = await async_client.get("/api/v1/documents/not-a-valid-uuid", headers=headers)
 
-    assert resp.status_code in (422, 400)
+    assert resp.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -730,6 +742,41 @@ async def test_get_document_detail_no_storage_access(
         mock_storage.save.assert_not_called()
         mock_storage.delete.assert_not_called()
         mock_storage.exists.assert_not_called()
+        mock_storage.get_metadata.assert_not_called()
+        mock_storage.generate_key.assert_not_called()
+        mock_storage.initialize.assert_not_called()
+        mock_storage.close.assert_not_called()
+    finally:
+        app.dependency_overrides.pop(get_storage, None)
+
+
+@pytest.mark.asyncio
+async def test_list_documents_no_storage_access(
+    async_client: AsyncClient, sample_user: User
+) -> None:
+    """Verify GET /documents accesses database only, never invoking StorageBackend."""
+    if not await is_postgres_available():
+        pytest.skip("PostgreSQL is not reachable.")
+
+    await seed_document(user_id=sample_user.id, original_filename="list_no_io.pdf")
+
+    mock_storage = MagicMock(spec=StorageBackend)
+    from app.main import app
+
+    app.dependency_overrides[get_storage] = lambda: mock_storage
+
+    headers = get_auth_headers(sample_user)
+    try:
+        resp = await async_client.get("/api/v1/documents", headers=headers)
+        assert resp.status_code == 200
+        mock_storage.open.assert_not_called()
+        mock_storage.save.assert_not_called()
+        mock_storage.delete.assert_not_called()
+        mock_storage.exists.assert_not_called()
+        mock_storage.get_metadata.assert_not_called()
+        mock_storage.generate_key.assert_not_called()
+        mock_storage.initialize.assert_not_called()
+        mock_storage.close.assert_not_called()
     finally:
         app.dependency_overrides.pop(get_storage, None)
 

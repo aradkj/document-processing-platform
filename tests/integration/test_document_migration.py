@@ -72,7 +72,7 @@ async def test_migration_0010_upgrade_downgrade_reupgrade_cycle() -> None:
         await close_engine()
 
     finally:
-        # 3. Re-upgrade to 0010 head
+        # 3. Re-upgrade to 0010
         await asyncio.to_thread(command.upgrade, cfg, "0010_create_documents_table")
 
     # 4. Verify documents table and constraints are restored
@@ -109,3 +109,7 @@ async def test_migration_0010_upgrade_downgrade_reupgrade_cycle() -> None:
         assert "pk_documents" in idx_names
         assert "uq_documents_storage_key" in idx_names
         assert "ix_documents_user_id_created_at" in idx_names
+
+    # 5. Restore database to Alembic head for subsequent tests
+    await close_engine()
+    await asyncio.to_thread(command.upgrade, cfg, "head")

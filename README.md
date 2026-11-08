@@ -8,10 +8,10 @@ A modern, high-performance, and secure asynchronous backend for the Document Pro
 
 The platform provides a production-grade authentication engine (Phase 2), a decoupled storage abstraction (Phase 3.1), a robust document metadata database foundation (Phase 3.2), a hardened document upload subsystem (Phase 3.3), and a comprehensive document discovery and metadata management engine (Phase 3.4):
 - **Authenticated Document Listing:** `GET /api/v1/documents` endpoint enforcing strict JWT Bearer authentication, querying PostgreSQL with SQL-level owner isolation (`Document.user_id == current_user.id`) to guarantee tenants can never view foreign records.
-- **SQL-Level Pagination:** Configurable `limit` (default 20, range 1–100) and `offset` (default 0, ge 0) applied directly in PostgreSQL queries via `LIMIT` and `OFFSET`, paired with an exact count query matching identical filter conditions.
-- **Deterministic Multi-Column Sorting:** Controlled sorting by `created_at`, `updated_at`, `original_filename`, or `size_bytes` in either `asc` or `desc` order, stabilized by a secondary tie-breaker on document UUID (`Document.id`) to prevent pagination jitter.
-- **Precise Metadata Filtering:** Exact content-type filtering (`content_type`), ISO 8601 timezone-aware creation date boundaries (`created_after`, `created_before`) with chronological validation, and zero naive-datetime leakage.
-- **Safe Substring Filename Search (`q`):** Parameterized case-insensitive substring search (`ILIKE`) with automatic escaping of SQL LIKE wildcard metacharacters (`%`, `_`, and `\`), preventing SQL injection and pattern manipulation.
+- **SQL-Level Pagination:** Configurable `limit` (default 20, range 1–100) and `offset` (default 0, ge 0) applied directly in PostgreSQL queries via `LIMIT` and `OFFSET`, paired with an exact count query matching identical filter conditions. Deterministic secondary ordering by document UUID (`Document.id`) ensures stable pagination for unchanged datasets; standard SQL LIMIT/OFFSET concurrency limitations apply if records are concurrently inserted or deleted between page requests under READ COMMITTED isolation.
+- **Deterministic Multi-Column Sorting:** Controlled sorting by `created_at`, `updated_at`, `original_filename`, or `size_bytes` in either `asc` or `desc` order, stabilized by a secondary tie-breaker on document UUID (`Document.id`) to prevent pagination jitter on static datasets.
+- **Precise Metadata Filtering:** Exact content-type filtering (`content_type`), ISO 8601 timezone-aware creation date boundaries (`created_after`, `created_before`) with explicit UTC offset validation, chronological range enforcement, and rejection of naive datetimes.
+- **Safe Substring Filename Search (`q`):** Parameterized case-insensitive substring search (`ILIKE`) with automatic escaping of SQL LIKE wildcard metacharacters (`%`, `_`, and `\`) and rejection of null bytes and control characters, preventing SQL injection, driver errors, and pattern manipulation.
 - **Single Document Metadata Retrieval:** `GET /api/v1/documents/{document_id}` endpoint validating UUID paths, querying exclusively within the caller's ownership scope, and returning uniform HTTP 404 responses for nonexistent and cross-user IDs alike (anti-enumeration / IDOR defense).
 - **Zero Storage Leakage:** Listing and detail queries execute purely against PostgreSQL metadata without opening file descriptors, reading storage bytes, or exposing internal `storage_key` values or server directory structures.
 - **Authenticated Secure Document Upload:** `POST /api/v1/documents` endpoint enforcing JWT Bearer authentication, accepting multipart form uploads under the `file` field with strict client-tamper protection (`user_id` derived exclusively from server authentication context).
@@ -77,7 +77,7 @@ graph TD
 │   └── workflows/
 │       └── ci.yml             # GitHub Actions CI workflow (lint, typecheck, migrations, tests)
 ├── alembic/                   # Database migrations configuration & versions
-│   ├── versions/              # Reversible migration scripts (0001 through 0010)
+│   ├── versions/              # Reversible migration scripts (0001 through 0011)
 │   ├── env.py                 # Alembic async environment
 │   └── script.py.mako         # Migration script template
 ├── app/
@@ -90,7 +90,7 @@ graph TD
 │   │   └── v1/
 │   │       ├── __init__.py    # Version 1 router aggregator
 │   │       ├── auth.py        # 10 Authentication endpoints (register, login, refresh, me, reset, etc.)
-│   │       └── documents.py   # Document upload endpoint (POST /api/v1/documents)
+│   │       └── documents.py   # Document endpoints (upload, listing, metadata retrieval, download, deletion)
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py          # Pydantic Settings with production guardrails
@@ -106,15 +106,15 @@ graph TD
 │   │       ├── refresh_token.py # RefreshToken with family_id, jti, revocation
 │   │       ├── email_verification_token.py # EmailVerificationToken with SHA-256 hash
 │   │       ├── password_reset_token.py     # PasswordResetToken with SHA-256 hash
-│   │       └── document.py    # Document entity with storage_key, checksum, size, metadata
+│   │       └── document.py    # Document entity with storage_key, checksum, size, metadata, deletion_pending_at
 │   ├── schemas/
 │   │   ├── __init__.py
 │   │   ├── auth.py            # Pydantic request/response schemas with extra='forbid'
-│   │   └── document.py        # DocumentResponse schema with extra='forbid' and UUID/datetime serialization
+│   │   └── document.py        # DocumentResponse & PaginatedDocumentResponse schemas with extra='forbid'
 │   ├── services/
 │   │   ├── __init__.py
 │   │   ├── auth.py            # Registration, login, token rotation, profile updates
-│   │   ├── document.py        # Document upload orchestration, bounded streaming & compensation
+│   │   ├── document.py        # Document upload, listing, streaming download & coordinated deletion
 │   │   ├── document_validation.py # Filename sanitization, magic-byte detection, extension matching
 │   │   ├── email.py           # Email service with mock transport and async SMTP dispatch
 │   │   ├── email_verification.py # Token issuance, concurrent resend locks, verification
@@ -128,7 +128,7 @@ graph TD
 ├── docs/                      # Architectural documentation & audit reports
 │   ├── phase-2-final-review.md
 │   ├── storage-architecture.md # Storage architecture, security & streaming contracts (Phase 3.1)
-│   └── document-architecture.md # Document model, database integrity & upload architecture (Phase 3.2 - 3.3)
+│   └── document-architecture.md # Document model, database integrity, upload & listing architecture (Phase 3.2 - 3.4)
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py            # Pytest fixtures, test database engine & HTTPX async clients
@@ -408,5 +408,6 @@ Phase 3 establishes the document storage and management subsystem across distinc
 - **Phase 3.1 — Storage Architecture & Local Filesystem Foundation (Completed)**: Decoupled `StorageBackend` abstraction, `LocalStorage` backend with two-level prefix partitioning, atomic hard-link publication (`os.link`), bounded-memory streaming, and path traversal security.
 - **Phase 3.2 — Document Data Model & Database Integrity (Completed)**: SQLAlchemy `Document` model, PostgreSQL integrity constraints, composite index `(user_id, created_at)`, user deletion protection (`ON DELETE RESTRICT`, `passive_deletes="all"`), and Alembic migration `0010_create_documents_table`.
 - **Phase 3.3 — Secure Document Upload (Completed)**: Streaming upload endpoints (`POST /api/v1/documents`), magic-byte MIME validation (PDF, JPEG, PNG, TIFF, WebP), file size quota enforcement (`MAX_UPLOAD_SIZE_BYTES`), transactional PostgreSQL persistence, and automatic storage cleanup compensation upon database commit failure.
-- **Phase 3.4 — Document Listing & Management (Next)**: Metadata listing (`GET /api/v1/documents`), single document lookup (`GET /api/v1/documents/{id}`), pagination, and ownership verification.
-- **Phase 3.5 — Secure Download & Coordinated Deletion**: Streaming download endpoints (`GET /api/v1/documents/{id}/download`), Range headers, and coordinated two-phase deletion (atomic physical file unlink via `StorageBackend` followed by database metadata record removal).
+- **Phase 3.4 — Document Listing, Search, Filtering & Metadata Management (Completed)**: Authenticated metadata listing (`GET /api/v1/documents`), single document metadata lookup (`GET /api/v1/documents/{id}`), SQL-level pagination, deterministic sorting with UUID tie-breaking, metadata filtering, case-insensitive filename substring search (`q`) with wildcard escaping, and strict ownership isolation.
+- **Phase 3.5 — Secure Document Download, Streaming & Reliable Coordinated Deletion (Completed)**: Authenticated streaming download (`GET /api/v1/documents/{id}/download`) with RFC 6266 / RFC 5987 Content-Disposition encoding, ETag conditional 304 caching, bounded memory chunks, and durable two-phase coordinated deletion (`DELETE /api/v1/documents/{id}`) with crash recovery, row locking, and retry idempotency.
+- **Phase 4 — Document Processing Pipeline & OCR Subsystem (Next)**: Asynchronous task dispatch, optical character recognition (Tesseract / EasyOCR), PDF text parsing, structured layout analysis, and Celery / Redis background worker orchestration.

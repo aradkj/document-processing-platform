@@ -251,6 +251,10 @@ Query Execution:
 - For non-zero totals, the item query applies `.limit(limit).offset(offset)` in PostgreSQL.
 - Documents are never loaded into application RAM for Python-side slicing.
 
+#### Pagination Consistency & Concurrency Limitations:
+1. **Stable Ordering on Unchanged Datasets**: When the underlying dataset remains unchanged, primary column sorting combined with unique `Document.id` tie-breaking guarantees 100% deterministic, repeatable pagination without duplicates or missing items across pages.
+2. **Concurrent Modifications Limitation**: The API operates under PostgreSQL `READ COMMITTED` isolation. As with all SQL `OFFSET` pagination architectures, if documents are concurrently inserted or deleted while a client paginates across separate HTTP requests, rows may shift across page boundaries. Transaction-spanning snapshots across distinct requests are not provided.
+
 ### 10.4 Deterministic Sorting & Tie-Breaking
 Clients can sort by any of four supported model columns:
 - `created_at` (default)
@@ -264,13 +268,14 @@ To prevent unstable pagination (pagination jitter) when multiple documents share
 - `desc` sort: `.order_by(primary_col.desc(), Document.id.desc())`
 - `asc` sort: `.order_by(primary_col.asc(), Document.id.asc())`
 
-Because `Document.id` is a unique primary key, ordering is guaranteed to be strictly deterministic across paginated pages.
+Because `Document.id` is a unique primary key, ordering is guaranteed to be strictly deterministic for an unchanged dataset.
 
 ### 10.5 Metadata Filtering & Date Boundaries
 - **Content Type (`content_type`)**: Exact string matching against the server-detected, stored `Document.content_type`. Searching for an unmatched format returns `{"items": [], "total": 0}` with HTTP 200.
 - **Date Boundaries (`created_after`, `created_before`)**:
-  - Accept ISO 8601 strings.
+  - Accept ISO 8601 timezone-aware strings with an explicit UTC offset (e.g., `2026-11-01T00:00:00Z` or `2026-11-01T03:30:00+03:30`).
   - Require explicit timezone awareness (naive datetimes are rejected with `422 Unprocessable Content`).
+  - Comparisons operate on absolute points in time normalized in PostgreSQL.
   - Semantics: `created_after` matches `Document.created_at >= created_after`; `created_before` matches `Document.created_at <= created_before`.
   - Chronological validation: If both are supplied, `created_after <= created_before` is enforced; inverted ranges return `422 Unprocessable Content`.
 
@@ -278,6 +283,7 @@ Because `Document.id` is a unique primary key, ordering is guaranteed to be stri
 Filename search operates over `Document.original_filename` using case-insensitive partial substring matching:
 - **Wildcard Escaping**: SQL LIKE wildcards (`%` and `_`) and the escape character (`\`) are automatically escaped via `escape_like_wildcards()` before constructing the query: `Document.original_filename.ilike(f"%{escaped}%", escape="\\")`.
 - **Literal Search**: Searching for `100%` or `report_2026` treats `%` and `_` as literal characters rather than arbitrary pattern wildcards.
+- **Null Byte & Control Character Validation**: Search terms containing null bytes (`\0`) or ASCII control characters (`ord < 32` or `ord == 127`) are rejected with `422 Unprocessable Content` before querying the database, preventing database driver errors or unexpected behaviour.
 - **SQL Injection Resistance**: Queries use SQLAlchemy parameterized parameter binding, preventing SQL injection.
 - **Whitespace Handling**: Leading and trailing whitespace is trimmed. Whitespace-only search strings are treated as empty (no filter applied).
 - **Input Length**: Search terms are limited to 255 characters (matching the maximum column length); longer inputs return `422 Unprocessable Content`.
@@ -285,4 +291,61 @@ Filename search operates over `Document.original_filename` using case-insensitiv
 ### 10.7 Query Efficiency, Indexing & Scaling Considerations
 - **Index Reuse**: Default listing and creation date filtering leverage the existing composite B-tree index `ix_documents_user_id_created_at` (`user_id`, `created_at`). Because `user_id` is the leading index column, owner filtering is index-accelerated without needing a redundant standalone index on `user_id`.
 - **Scaling Filename Search**: The current substring search relies on PostgreSQL `ILIKE`. For datasets up to tens of thousands of documents per user, index scans on `user_id` followed by sequential filter evaluation on the user's subset of rows deliver sub-millisecond to low-millisecond latencies. For enterprise scale with millions of documents per user, adding the `pg_trgm` extension with a trigram GIN/GiST index on `(user_id, original_filename)` or delegating to an asynchronous search service is recommended in a later phase.
+
+---
+
+## 11. Secure Document Download & Reliable Coordinated Deletion (Phase 3.5)
+
+Phase 3.5 completes the document lifecycle operations by implementing secure, authenticated streaming downloads and crash-resilient, coordinated deletion across PostgreSQL and physical storage.
+
+### 11.1 Secure Streaming Download (`GET /api/v1/documents/{document_id}/download`)
+
+#### Authorization and Access Sequence:
+1. **Authentication**: Enforces JWT bearer token via `get_current_user`.
+2. **Owner Verification Before Storage Access**: Queries PostgreSQL directly enforcing `Document.id == document_id` and `Document.user_id == current_user.id`.
+3. **Lifecycle State Check**: Restricts access to active records (`Document.deletion_pending_at.is_(None)`). Documents marked pending deletion return HTTP 404 (indistinguishable from nonexistent or foreign-owned documents).
+4. **Storage Access**: Calls `StorageBackend.open(storage_key)` only after successful authorization. Never exposes internal filesystem paths or storage keys to the client.
+
+#### Streaming Architecture & Memory Bounds:
+- Streams data in bounded chunks (`settings.STORAGE_CHUNK_SIZE`, default 1 MiB) via `StoredObjectReader.chunks()`.
+- Never loads entire document contents into application RAM.
+- Employs an async generator with a guaranteed `finally` block ensuring `reader.close()` executes on complete downloads, client disconnects, streaming errors, or request cancellation.
+
+#### Standards-Compliant Headers:
+- `Content-Type`: Server-verified media MIME type from database metadata.
+- `Content-Length`: Verified byte size from database metadata describing the stored payload.
+- `Content-Disposition`: Attachment format implementing RFC 6266 and RFC 5987. Constructs a safe ASCII fallback (`filename="document.pdf"`) alongside a percent-encoded UTF-8 attribute (`filename*=UTF-8''...`). Protects against CRLF injection, control characters, and path separators. Fully supports Persian (`فاکتور.pdf`), spaces, and parentheses.
+- `X-Content-Type-Options: nosniff`: Prevents client MIME-type sniffing.
+- `Cache-Control: private, no-cache`: Directs clients to revalidate cached responses.
+- `ETag & Conditional Caching`: Exposes the verified SHA-256 digest in quoted format (`"hash"`). When an incoming `If-None-Match` header matches, returns HTTP 304 Not Modified immediately without opening storage.
+- `Range Requests`: HTTP Range requests are not advertised (`Accept-Ranges` is omitted) and partial-content responses are not generated. Complete file streaming is enforced.
+
+### 11.2 Reliable Coordinated Deletion (`DELETE /api/v1/documents/{document_id}`)
+
+Because PostgreSQL transactions and filesystem deletions cannot participate in a single two-phase distributed commit, Phase 3.5 implements a durable, crash-resilient state machine:
+
+```text
+[ Active Document ]
+        │
+        ▼ (Step 1: SELECT ... FOR UPDATE)
+[ Set deletion_pending_at = NOW() ]
+        │
+        ▼ (Step 2: Commit intent to PostgreSQL)
+[ Deletion Intent Persisted ]
+        │
+        ▼ (Step 3: StorageBackend.delete(storage_key, missing_ok=True))
+[ Physical File Deleted ]
+        │
+        ▼ (Step 4: DELETE FROM documents WHERE id = document_id)
+[ Database Record Removed ] ──> HTTP 204 No Content
+```
+
+#### Durability & State Machine Semantics:
+1. **Durable Intent Persistence**: The deletion intent is committed to PostgreSQL (`deletion_pending_at`) before attempting storage file removal.
+2. **Metadata & Listing Masking**: Records with `deletion_pending_at IS NOT NULL` are immediately excluded from `GET /api/v1/documents`, detail queries (`GET /api/v1/documents/{id}`), and download endpoints (`GET /api/v1/documents/{id}/download`).
+3. **Storage Unlink (`missing_ok=True`)**: Storage cleanup uses `missing_ok=True`. If an earlier attempt already deleted the file or the process crashed mid-way, subsequent retries proceed safely.
+4. **Row Lock Concurrency Protection**: Step 1 acquires a row-level lock (`SELECT ... FOR UPDATE`), ensuring concurrent deletion requests for the same document execute deterministically without deadlocks or double-free errors.
+5. **Database Finalization**: Metadata rows are removed only after physical storage deletion succeeds.
+6. **Cancellation & Uncertain Commit Safety**: If database commits fail or are cancelled, the service queries row existence to verify whether the commit took effect or retains the pending-deletion state for retry reconciliation.
+7. **Cross-Platform Handling**: On Windows, files held open by an active download stream prevent immediate unlinking (sharing violations). The storage deletion fails safely with `StoragePermissionError`, the database record remains in pending-deletion state, and a subsequent DELETE request finalizes cleanup once the reader closes. On POSIX platforms, unlinking an open inode safely dissociates the directory entry while the open file descriptor finishes streaming.
 

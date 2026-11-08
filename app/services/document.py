@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import urllib.parse
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import UploadFile
@@ -43,6 +45,22 @@ class DocumentStorageError(DocumentUploadError):
 
 class DocumentPersistenceError(DocumentUploadError):
     """Raised when document metadata persistence in PostgreSQL fails."""
+
+
+class DocumentDeletionError(Exception):
+    """Base exception for document deletion failures."""
+
+
+class DocumentNotFoundError(DocumentDeletionError):
+    """Raised when document does not exist or does not belong to the user."""
+
+
+class DocumentStorageDeletionError(DocumentDeletionError):
+    """Raised when physical storage deletion fails, retaining document in pending state."""
+
+
+class DocumentDatabaseFinalizationError(DocumentDeletionError):
+    """Raised when database row removal fails after physical deletion."""
 
 
 async def upload_document(
@@ -260,6 +278,87 @@ async def upload_document(
         await file.close()
 
 
+def format_content_disposition(filename: str) -> str:
+    """Format an RFC 6266 and RFC 5987 compliant Content-Disposition header value.
+
+    Guarantees:
+    - Protects against CRLF injection and header manipulation.
+    - Strips path separators and control characters.
+    - Provides a safe ASCII fallback quoted-string for legacy clients.
+    - Provides a UTF-8 percent-encoded filename* parameter for modern clients.
+    - Properly supports Persian and other Unicode scripts, spaces, and parentheses.
+    """
+    sanitized = re.sub(r"[\r\n\x00-\x1f\x7f/\\]", "", filename).strip()
+    if not sanitized:
+        sanitized = "document"
+
+    stem = ""
+    ext = ""
+    if "." in sanitized:
+        stem, ext = sanitized.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        stem = sanitized
+
+    ascii_stem = "".join(
+        ch if (32 <= ord(ch) <= 126 and ch not in ('"', "\\", ";")) else "_" for ch in stem
+    ).strip(" ._")
+
+    ascii_ext = "".join(
+        ch if (32 <= ord(ch) <= 126 and ch not in ('"', "\\", ";")) else "" for ch in ext
+    )
+
+    if not ascii_stem:
+        ascii_stem = "document"
+
+    ascii_clean = f"{ascii_stem}{ascii_ext}"
+    utf8_encoded = urllib.parse.quote(sanitized, safe="!#$&+-.^_`|~")
+    return f"attachment; filename=\"{ascii_clean}\"; filename*=UTF-8''{utf8_encoded}"
+
+
+ETAG_LIST_PATTERN = re.compile(r'(?:(W/))?"([^"]*)"', re.ASCII)
+
+
+def matches_if_none_match(header_val: str | None, current_etag: str) -> bool:
+    """Evaluate RFC 9110 weak comparison semantics for HTTP If-None-Match on GET.
+
+    Handles:
+    - Exact matching strong ETag: '"hash"'
+    - Wildcard: '*'
+    - Multiple comma-separated ETags: '"tag1", "hash", "tag2"'
+    - ETags containing commas inside quotes: '"tag,with,comma", "hash"'
+    - Weak ETags: 'W/"hash"'
+    - Malformed input safely returns False (stream full content).
+    """
+    if not header_val:
+        return False
+
+    cleaned = header_val.strip()
+    if not cleaned:
+        return False
+
+    # Extract target opaque-tag
+    target_opaque = current_etag
+    if target_opaque.startswith("W/"):
+        target_opaque = target_opaque[2:]
+    if target_opaque.startswith('"') and target_opaque.endswith('"') and len(target_opaque) >= 2:
+        target_opaque = target_opaque[1:-1]
+
+    # RFC 9110 Section 13.1.2: '*' matches any existing representation
+    if cleaned == "*":
+        return True
+
+    try:
+        for match in ETAG_LIST_PATTERN.finditer(cleaned):
+            _weak_prefix, tag_value = match.groups()
+            if tag_value == target_opaque:
+                return True
+    except Exception:
+        return False
+
+    return False
+
+
 def escape_like_wildcards(text: str, escape_char: str = "\\") -> str:
     """Escape SQL LIKE wildcard characters (%, _) and the escape character itself."""
     return (
@@ -274,14 +373,39 @@ async def get_document_by_id(
     *,
     document_id: uuid.UUID,
     user_id: uuid.UUID,
+    include_pending_deletion: bool = False,
 ) -> Document | None:
     """Retrieve metadata for a single document owned by user_id.
 
-    Returns None if the document does not exist or belongs to another user.
+    Returns None if the document does not exist, belongs to another user,
+    or is marked pending deletion (unless include_pending_deletion is True).
+    """
+    conditions = [
+        Document.id == document_id,
+        Document.user_id == user_id,
+    ]
+    if not include_pending_deletion:
+        conditions.append(Document.deletion_pending_at.is_(None))
+    stmt = select(Document).where(*conditions)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_active_document_for_download(
+    session: AsyncSession,
+    *,
+    document_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> Document | None:
+    """Retrieve an active, non-pending document for authenticated streaming download.
+
+    Enforces ownership and active lifecycle state directly in PostgreSQL.
+    Returns None if nonexistent, foreign-owned, or pending deletion.
     """
     stmt = select(Document).where(
         Document.id == document_id,
         Document.user_id == user_id,
+        Document.deletion_pending_at.is_(None),
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
@@ -302,14 +426,22 @@ async def list_documents(
 ) -> tuple[list[Document], int]:
     """Query, filter, and paginate documents owned by user_id with deterministic sorting.
 
-    Guarantees:
+    Guarantees & Semantics:
     - Strict owner isolation in SQL (Document.user_id == user_id).
+    - Hides pending-deletion documents (Document.deletion_pending_at.is_(None)).
     - Database-level pagination via LIMIT and OFFSET.
-    - Deterministic tie-breaking using Document.id.
+    - Deterministic tie-breaking using Document.id: ensures stable ordering across
+      paginated pages when the underlying dataset remains unchanged.
+    - Concurrency Limitation: Under standard SQL LIMIT/OFFSET pagination in READ COMMITTED
+      isolation, concurrent inserts or deletions by the user between separate HTTP requests
+      may cause items to shift across page boundaries.
     - Parameterized SQL with wildcard escaping for filename search.
     - Total count calculated using identical filtering criteria.
     """
-    conditions = [Document.user_id == user_id]
+    conditions = [
+        Document.user_id == user_id,
+        Document.deletion_pending_at.is_(None),
+    ]
 
     if content_type is not None:
         trimmed_ct = content_type.strip()
@@ -365,3 +497,140 @@ async def list_documents(
     items = list(result.scalars().all())
 
     return items, total
+
+
+async def delete_document(
+    *,
+    document_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session: AsyncSession,
+    storage: StorageBackend,
+) -> bool:
+    """Reliably and durably coordinate document deletion across PostgreSQL and StorageBackend.
+
+    Lifecycle Steps:
+    1. Authorization & Lookup:
+       Query document with row-level lock (FOR UPDATE) scoped strictly to (document_id, user_id).
+       If not found, raise DocumentNotFoundError (caller maps to 404).
+    2. Durable Deletion Intent:
+       If document is active (deletion_pending_at is None):
+           Mark document.deletion_pending_at = datetime.now(UTC).
+           Commit deletion intent to PostgreSQL immediately.
+           If commit fails: rollback, document remains active, file is untouched.
+       If document is already pending deletion:
+           Intent is already persisted; resume deletion workflow.
+    3. Storage Cleanup:
+       Call storage.delete(storage_key, missing_ok=True).
+       If storage.delete fails:
+           Keep document in pending-deletion state in PostgreSQL.
+           Do not remove database row.
+           Raise DocumentStorageDeletionError (caller returns 500/503 for retry).
+    4. Database Finalization:
+       Delete document row from PostgreSQL and commit.
+       If commit fails or is cancelled:
+           Re-verify database state to ensure row deletion or retain pending state.
+           Raise DocumentDatabaseFinalizationError if row could not be confirmed deleted.
+    5. Success:
+       Returns True when both physical object and database record are confirmed removed.
+    """
+    # Step 1: Authorization and lookup with row lock
+    stmt = (
+        select(Document)
+        .where(Document.id == document_id, Document.user_id == user_id)
+        .with_for_update()
+    )
+    res = await session.execute(stmt)
+    doc = res.scalar_one_or_none()
+
+    if doc is None:
+        raise DocumentNotFoundError("Document not found.")
+
+    storage_key = doc.storage_key
+
+    # Step 2: Persist deletion intent if not already pending
+    if doc.deletion_pending_at is None:
+        doc.deletion_pending_at = datetime.now(UTC)
+        try:
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            logger.error(
+                "Failed to persist deletion intent for document '%s': %s",
+                document_id,
+                exc,
+                extra={"document_id": str(document_id), "user_id": str(user_id)},
+            )
+            raise DocumentDeletionError("Failed to persist document deletion intent.") from exc
+    else:
+        # Commit/release row lock during storage deletion
+        await session.commit()
+
+    # Step 3: Physical storage deletion
+    try:
+        await storage.delete(storage_key, missing_ok=True)
+    except Exception as exc:
+        logger.error(
+            "Storage deletion failed for doc '%s' (key='%s'). Retaining pending state: %s",
+            document_id,
+            storage_key,
+            exc,
+            extra={"document_id": str(document_id), "user_id": str(user_id)},
+        )
+        raise DocumentStorageDeletionError("Failed to remove stored physical object.") from exc
+
+    # Step 4: Finalize database row removal
+    try:
+        res = await session.execute(
+            select(Document)
+            .where(Document.id == document_id, Document.user_id == user_id)
+            .with_for_update()
+        )
+        doc_to_delete = res.scalar_one_or_none()
+        if doc_to_delete is not None:
+            await session.delete(doc_to_delete)
+            await session.commit()
+        else:
+            await session.commit()
+    except asyncio.CancelledError as cancel_exc:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        try:
+            check_res = await session.execute(select(Document.id).where(Document.id == document_id))
+            if check_res.scalar_one_or_none() is not None:
+                logger.warning(
+                    "Deletion cancelled during final commit; doc '%s' remains in pending state.",
+                    document_id,
+                    extra={"document_id": str(document_id), "user_id": str(user_id)},
+                )
+            else:
+                logger.info(
+                    "Deletion cancelled during commit, but row '%s' was deleted successfully.",
+                    document_id,
+                    extra={"document_id": str(document_id), "user_id": str(user_id)},
+                )
+        except Exception:
+            pass
+        raise cancel_exc
+    except Exception as exc:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        try:
+            check_res = await session.execute(select(Document.id).where(Document.id == document_id))
+            if check_res.scalar_one_or_none() is None:
+                return True
+        except Exception:
+            pass
+        logger.critical(
+            "CRITICAL: Failed to finalize database deletion for doc '%s' after file removed. "
+            "Document remains in pending state for retry. Error: %s",
+            document_id,
+            exc,
+            extra={"document_id": str(document_id), "user_id": str(user_id)},
+        )
+        raise DocumentDatabaseFinalizationError("Failed to finalize document removal.") from exc
+
+    return True

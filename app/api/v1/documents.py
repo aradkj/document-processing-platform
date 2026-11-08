@@ -1,11 +1,24 @@
-"""API endpoints for document persistence, secure uploads, listing, and metadata retrieval."""
+"""API endpoints for document persistence, uploads, listing, download, and deletion."""
 
 import logging
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -14,11 +27,19 @@ from app.db.models.user import User
 from app.db.session import get_db_session
 from app.schemas.document import DocumentResponse, PaginatedDocumentResponse
 from app.services.document import (
+    DocumentDatabaseFinalizationError,
+    DocumentDeletionError,
+    DocumentNotFoundError,
     DocumentPersistenceError,
+    DocumentStorageDeletionError,
     DocumentStorageError,
     UploadSizeExceededError,
+    delete_document,
+    format_content_disposition,
+    get_active_document_for_download,
     get_document_by_id,
     list_documents,
+    matches_if_none_match,
     upload_document,
 )
 from app.services.document_validation import (
@@ -28,6 +49,7 @@ from app.services.document_validation import (
     UnsupportedFileTypeError,
 )
 from app.storage import StorageBackend, get_storage
+from app.storage.exceptions import StorageError, StorageObjectNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -105,14 +127,20 @@ async def list_documents_endpoint(
     created_after: Annotated[
         datetime | None,
         Query(
-            description="Filter documents created at or after this ISO 8601 UTC timestamp.",
+            description=(
+                "Filter documents created at or after this ISO 8601 timezone-aware "
+                "datetime with an explicit UTC offset."
+            ),
             examples=["2026-11-01T00:00:00Z"],
         ),
     ] = None,
     created_before: Annotated[
         datetime | None,
         Query(
-            description="Filter documents created at or before this ISO 8601 UTC timestamp.",
+            description=(
+                "Filter documents created at or before this ISO 8601 timezone-aware "
+                "datetime with an explicit UTC offset."
+            ),
             examples=["2026-11-30T23:59:59Z"],
         ),
     ] = None,
@@ -148,6 +176,14 @@ async def list_documents_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Parameter 'created_after' cannot be later than 'created_before'.",
+            )
+
+    # Validate search string for null bytes and control characters
+    if q is not None:
+        if "\0" in q or any(ord(c) < 32 or ord(c) == 127 for c in q):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Parameter 'q' contains invalid control characters or null bytes.",
             )
 
     items, total = await list_documents(
@@ -219,6 +255,206 @@ async def get_document_endpoint(
             detail="Document not found",
         )
     return DocumentResponse.model_validate(doc)
+
+
+@router.get(
+    "/{document_id}/download",
+    status_code=status.HTTP_200_OK,
+    summary="Download document binary file",
+    description=(
+        "Stream binary content of an authenticated user's active document. "
+        "Strictly verifies ownership before storage access. Excludes pending-deletion documents. "
+        "Streams bounded chunks with RFC 6266 / RFC 5987 Content-Disposition encoding."
+    ),
+    response_class=StreamingResponse,
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Binary document content stream.",
+            "content": {"application/octet-stream": {}},
+        },
+        status.HTTP_304_NOT_MODIFIED: {
+            "description": "Content not modified (ETag matched If-None-Match).",
+        },
+        status.HTTP_401_UNAUTHORIZED: {
+            "description": "Not authenticated or invalid Bearer token.",
+        },
+        status.HTTP_404_NOT_FOUND: {
+            "description": "Document not found or belongs to another user.",
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": "Invalid document UUID format.",
+        },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "Internal storage failure.",
+        },
+    },
+)
+async def download_document_endpoint(
+    document_id: Annotated[
+        uuid.UUID,
+        Path(
+            description="Unique logical identifier (UUID) of the document to download.",
+            examples=["9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"],
+        ),
+    ],
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    storage: Annotated[StorageBackend, Depends(get_storage)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    if_none_match: Annotated[
+        str | None,
+        Header(
+            description="Optional ETag condition to check if document content is unchanged.",
+        ),
+    ] = None,
+) -> Response:
+    """Stream stored document binary bytes with ownership enforcement and bounded memory."""
+    user_id_str = str(current_user.id)
+    doc = await get_active_document_for_download(
+        session,
+        document_id=document_id,
+        user_id=current_user.id,
+    )
+    if doc is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+
+    etag_value = f'"{doc.sha256}"'
+    if matches_if_none_match(if_none_match, etag_value):
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={
+                "ETag": etag_value,
+                "Cache-Control": "private, no-cache",
+            },
+        )
+
+    try:
+        reader = await storage.open(doc.storage_key)
+    except StorageObjectNotFoundError as exc:
+        logger.error(
+            "Internal consistency error: doc '%s' exists in DB but missing from storage.",
+            document_id,
+            extra={"document_id": str(document_id), "user_id": user_id_str},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document storage object is temporarily unavailable.",
+        ) from exc
+    except StorageError as exc:
+        logger.error(
+            "Storage access error opening document '%s': %s",
+            document_id,
+            exc,
+            extra={"document_id": str(document_id), "user_id": user_id_str},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to access document storage.",
+        ) from exc
+
+    async def content_iterator() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in reader.chunks(settings.STORAGE_CHUNK_SIZE):
+                yield chunk
+        except Exception as stream_err:
+            logger.error(
+                "Error streaming document bytes for doc '%s': %s",
+                document_id,
+                stream_err,
+                extra={"document_id": str(document_id), "user_id": user_id_str},
+            )
+            raise
+        finally:
+            if not reader.closed:
+                reader.close()
+
+    return StreamingResponse(
+        content_iterator(),
+        status_code=status.HTTP_200_OK,
+        media_type=doc.content_type,
+        headers={
+            "Content-Length": str(doc.size_bytes),
+            "Content-Disposition": format_content_disposition(doc.original_filename),
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-cache",
+            "ETag": etag_value,
+        },
+    )
+
+
+@router.delete(
+    "/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a document",
+    description=(
+        "Reliably delete an authenticated user's document. "
+        "Applies a durable two-phase deletion workflow: persists deletion intent, "
+        "removes physical storage object, and finalizes database metadata removal. "
+        "Safe against retries, crashes, and concurrent requests."
+    ),
+    responses={
+        status.HTTP_204_NO_CONTENT: {
+            "description": "Document successfully deleted from storage and database.",
+        },
+        status.HTTP_401_UNAUTHORIZED: {
+            "description": "Not authenticated or invalid Bearer token.",
+        },
+        status.HTTP_404_NOT_FOUND: {
+            "description": "Document not found or belongs to another user.",
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": "Invalid document UUID format.",
+        },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "Failed to complete coordinated document deletion.",
+        },
+    },
+)
+async def delete_document_endpoint(
+    document_id: Annotated[
+        uuid.UUID,
+        Path(
+            description="Unique logical identifier (UUID) of the document to delete.",
+            examples=["9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"],
+        ),
+    ],
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    storage: Annotated[StorageBackend, Depends(get_storage)],
+) -> Response:
+    """Coordinate reliable document deletion across storage and database."""
+    user_id_str = str(current_user.id)
+    try:
+        await delete_document(
+            document_id=document_id,
+            user_id=current_user.id,
+            session=session,
+            storage=storage,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except DocumentNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        ) from exc
+    except (
+        DocumentStorageDeletionError,
+        DocumentDatabaseFinalizationError,
+        DocumentDeletionError,
+    ) as exc:
+        logger.error(
+            "Failed coordinated deletion for doc '%s': %s",
+            document_id,
+            exc,
+            extra={"document_id": str(document_id), "user_id": user_id_str},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to complete document deletion. Please retry.",
+        ) from exc
 
 
 @router.post(
