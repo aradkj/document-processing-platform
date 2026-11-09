@@ -4,32 +4,24 @@ A modern, high-performance, and secure asynchronous backend for the Document Pro
 
 ## Current Phase
 
-**Phase 3.4 — Document Listing, Search, Filtering & Metadata Management (Completed)**
+**Phase 4.1 — Processing Architecture & Foundation (Completed)**
 
-The platform provides a production-grade authentication engine (Phase 2), a decoupled storage abstraction (Phase 3.1), a robust document metadata database foundation (Phase 3.2), a hardened document upload subsystem (Phase 3.3), and a comprehensive document discovery and metadata management engine (Phase 3.4):
-- **Authenticated Document Listing:** `GET /api/v1/documents` endpoint enforcing strict JWT Bearer authentication, querying PostgreSQL with SQL-level owner isolation (`Document.user_id == current_user.id`) to guarantee tenants can never view foreign records.
-- **SQL-Level Pagination:** Configurable `limit` (default 20, range 1–100) and `offset` (default 0, ge 0) applied directly in PostgreSQL queries via `LIMIT` and `OFFSET`, paired with an exact count query matching identical filter conditions. Deterministic secondary ordering by document UUID (`Document.id`) ensures stable pagination for unchanged datasets; standard SQL LIMIT/OFFSET concurrency limitations apply if records are concurrently inserted or deleted between page requests under READ COMMITTED isolation.
-- **Deterministic Multi-Column Sorting:** Controlled sorting by `created_at`, `updated_at`, `original_filename`, or `size_bytes` in either `asc` or `desc` order, stabilized by a secondary tie-breaker on document UUID (`Document.id`) to prevent pagination jitter on static datasets.
-- **Precise Metadata Filtering:** Exact content-type filtering (`content_type`), ISO 8601 timezone-aware creation date boundaries (`created_after`, `created_before`) with explicit UTC offset validation, chronological range enforcement, and rejection of naive datetimes.
-- **Safe Substring Filename Search (`q`):** Parameterized case-insensitive substring search (`ILIKE`) with automatic escaping of SQL LIKE wildcard metacharacters (`%`, `_`, and `\`) and rejection of null bytes and control characters, preventing SQL injection, driver errors, and pattern manipulation.
-- **Single Document Metadata Retrieval:** `GET /api/v1/documents/{document_id}` endpoint validating UUID paths, querying exclusively within the caller's ownership scope, and returning uniform HTTP 404 responses for nonexistent and cross-user IDs alike (anti-enumeration / IDOR defense).
-- **Zero Storage Leakage:** Listing and detail queries execute purely against PostgreSQL metadata without opening file descriptors, reading storage bytes, or exposing internal `storage_key` values or server directory structures.
-- **Authenticated Secure Document Upload:** `POST /api/v1/documents` endpoint enforcing JWT Bearer authentication, accepting multipart form uploads under the `file` field with strict client-tamper protection (`user_id` derived exclusively from server authentication context).
-- **Strict Filename Validation & Normalization:** Unicode NFC normalization, null byte (`\0`, `%00`), path separator (`/`, `\\`), colon (`:`), traversal (`..`), control character, and length boundary (1–255 chars) validation. Missing stems or extensions are rejected.
-- **Content-Type Signature Detection (Magic Bytes):** Initial byte signature identification for PDF (`%PDF-`), JPEG (`\xFF\xD8\xFF`), PNG (`\x89PNG\r\n\x1a\n`), TIFF (`II*\x00` and `MM\x00*`), and WebP (`RIFF...WEBP`), cross-validated against allowed filename extensions to prevent naive extension spoofing. Magic-byte checks identify formats by header signature but do not perform deep structural parsing, decompression, or malware/antivirus scanning (deferred to Phase 4 OCR processing).
-- **Bounded-Memory Streaming & Quota Enforcement:** Asynchronous generator streaming in chunks (default 1MB buffer) directly to `StorageBackend` without buffering entire payloads in memory; configurable size quota via `MAX_UPLOAD_SIZE_BYTES` (default 20MB) with early stream termination, consistent HTTP 413 error mapping across all chunk boundaries, and incremental SHA-256 calculation.
-- **Cancellation-Safe Consistency & Storage Compensation:** Persistence to PostgreSQL `documents` table tied to authenticated `user.id`. In the event of database transaction failure or task cancellation, two-phase compensation triggers an immediate physical unlink via `storage.delete(storage_key, missing_ok=True)` to prevent orphaned files, while verifying database state to ensure committed records are never severed from their storage objects.
-- **Document Domain Model:** Full SQLAlchemy `Document` model tracking logical identity, owner reference, opaque storage key, display filename, content type, 64-bit size, and SHA-256 checksum.
-- **Database-Level Integrity Constraints:** Native PostgreSQL check constraints validating 32-character lowercase hex storage keys, 64-character SHA-256 checksums, and non-negative file sizing.
-- **Optimized B-tree Indexing:** Composite index `(user_id, created_at)` optimizing owner queries and ordered pagination without duplicate standalone index overhead.
-- **User Deletion Protection:** Foreign key `ON DELETE RESTRICT` with `passive_deletes="all"` preventing parent user deletion from orphaning external physical files on storage and suppressing in-memory foreign key nullification.
-- **Alembic Migration 0010:** Clean, bidirectional migration with verified upgrade, downgrade, and re-upgrade cycles against live PostgreSQL.
-- **Abstract Storage Backend:** Clean asynchronous contracts (`StorageBackend`, `StoredObjectReader`) independent of web frameworks, HTTP uploads, and database models.
-- **Local Filesystem Implementation:** `LocalStorage` backend with cryptographically secure, opaque 32-hex keys partitioned across 2-level subdirectories (`ab/cd/abcdef...`).
-- **Atomic File Writes & Cleanup:** Temporary staging writes with automatic rollback/cleanup on stream failures; atomic publication via hard link (`os.link`) with fail-closed protection on unsupported filesystems.
-- **Full Authentication System:** Case-insensitive identity, Argon2id hashing, dual-token JWT, refresh token rotation & reuse detection, email verification, and password reset.
+The platform provides a comprehensive architecture across Authentication (Phase 2), Storage Abstraction (Phase 3.1), Document Models (Phase 3.2), Secure Document Upload (Phase 3.3), Listing & Metadata Management (Phase 3.4), Secure Download & Coordinated Deletion (Phase 3.5), and Processing Architecture & Foundation (Phase 4.1):
+- **Processing Engine Architecture:** Decoupled `app/processing/` package independent of FastAPI requests, HTTP transports, and database sessions.
+- **Processor Contract (`BaseProcessor`):** Common abstract interface exposing processor identity, semantic versioning, supported MIME formats, and declared capabilities (`ProcessingCapability`).
+- **Immutable Processing Context (`ProcessingContext`):** Strongly typed execution context carrying document UUID, normalized filename, media type, size, SHA-256 digest, resource boundaries, and non-seekable streaming reader (`StoredObjectReader`) without duplicating file bytes in memory.
+- **Versioned Processing Result (`ProcessingResult`):** Deterministic JSON-serializable schema with strict validation, optional per-page results (`PageResult`), sanitized warnings/errors, and metrics.
+- **Deterministic Processor Registry (`ProcessorRegistry`):** Centralized registry mapping normalized media types to registered processor instances, rejecting ambiguous collisions without silent fallback.
+- **Processing-Time Format Verification (`FormatDetector`):** Stream inspection validating true magic-byte content signatures at processing time rather than trusting client headers or extensions.
+- **Processing Resource Limits & Configuration:** Configurable boundaries (`PROCESSING_MAX_INPUT_SIZE_BYTES`, `PROCESSING_TIMEOUT_SECONDS`, `PROCESSING_MAX_TEXT_SIZE_BYTES`, `PROCESSING_MAX_PAGES`, `PROCESSING_MAX_IMAGE_PIXELS`, `PROCESSING_MAX_METADATA_SIZE_BYTES`) with strict Pydantic validation.
+- **Safe Exception Hierarchy (`ProcessingError`):** Machine-readable error codes with automated scrubbing of internal filesystem paths and server details.
+- **Phase 5 Worker Compatibility:** Complete interface parity allowing identical execution from future background workers (Celery, RQ) without HTTP dependencies.
+- **Secure Document Download & Streaming (Phase 3.5):** Bounded-memory streaming with RFC 9110 weak ETag conditional caching (`If-None-Match`), UTF-8 encoded `Content-Disposition`, and storage descriptor leak prevention.
+- **Reliable Coordinated Deletion (Phase 3.5):** Two-phase deletion with `deletion_pending_at` timestamp hiding pending documents from queries, serialized via row-level locks (`SELECT ... FOR UPDATE`), ensuring consistent physical storage unlinking and database cleanup.
+- **Authenticated Document Listing (Phase 3.4):** SQL-level owner isolation, deterministic pagination, multi-column sorting, and sanitized substring search (`ILIKE`).
+- **Secure Document Upload (Phase 3.3):** Bounded streaming upload with magic-byte validation, atomic compensation, and SHA-256 integrity verification.
 
-*Note: Document download, deletion, OCR processing pipelines, async workers, and AI features belong to subsequent Phase 3 and Phase 4 sub-phases (starting with Phase 3.5).*
+*Note: Concrete PDF parsing, image decoding, OCR pipelines, and distributed worker execution belong to subsequent phases (Phase 4.2–4.5, Phase 5).*
 
 ---
 

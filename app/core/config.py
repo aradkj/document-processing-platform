@@ -167,11 +167,57 @@ class Settings(BaseSettings):
     )
 
     # Document Upload Configuration (Phase 3.3)
+    # Note on tiered limits: MAX_UPLOAD_SIZE_BYTES controls API ingress acceptance.
+    # PROCESSING_MAX_INPUT_SIZE_BYTES controls downstream processing eligibility.
+    # Stored documents may be rejected at processing time if exceeding processing limits.
     MAX_UPLOAD_SIZE_BYTES: int = Field(
         default=20971520,  # 20 MiB (20 * 1024 * 1024 bytes)
         ge=1,  # minimum 1 byte
         le=524288000,  # maximum 500 MiB
-        description="Maximum allowed document upload file size in bytes (default: 20 MiB)",
+        description=(
+            "Maximum allowed document upload file size in bytes at API ingress (default: 20 MiB)"
+        ),
+    )
+
+    # Document Processing Configuration (Phase 4.1)
+    PROCESSING_MAX_INPUT_SIZE_BYTES: int = Field(
+        default=20971520,  # 20 MiB (20 * 1024 * 1024 bytes)
+        ge=1,
+        le=524288000,
+        description=(
+            "Maximum document size in bytes eligible for CPU/memory-intensive processing "
+            "(intentionally decoupled from upload limit; default: 20 MiB)"
+        ),
+    )
+    PROCESSING_TIMEOUT_SECONDS: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=3600.0,
+        description="Maximum processing execution duration in seconds before timing out",
+    )
+    PROCESSING_MAX_TEXT_SIZE_BYTES: int = Field(
+        default=10485760,  # 10 MiB (10 * 1024 * 1024 bytes)
+        ge=1024,
+        le=104857600,  # 100 MiB
+        description="Maximum extracted plain text size in bytes",
+    )
+    PROCESSING_MAX_PAGES: int = Field(
+        default=1000,
+        ge=1,
+        le=50000,
+        description="Maximum allowed page count in a single document for processing",
+    )
+    PROCESSING_MAX_IMAGE_PIXELS: int = Field(
+        default=50000000,  # 50 Megapixels
+        ge=1000,
+        le=500000000,
+        description="Maximum allowed image pixel count (width * height)",
+    )
+    PROCESSING_MAX_METADATA_SIZE_BYTES: int = Field(
+        default=65536,  # 64 KiB
+        ge=1024,
+        le=1048576,  # 1 MiB
+        description="Maximum size in bytes for extracted metadata payload",
     )
 
     def __init__(self, _env_file: str | None = ".env", **values: Any) -> None:
