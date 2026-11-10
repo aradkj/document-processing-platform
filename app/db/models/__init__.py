@@ -1,6 +1,10 @@
 """Database domain models package."""
 
 from app.db.models.document import Document
+from app.db.models.document_processing import (
+    DocumentProcessing,
+    ProcessingLifecycleStatus,
+)
 from app.db.models.email_verification_token import EmailVerificationToken
 from app.db.models.password_reset_token import PasswordResetToken
 from app.db.models.permission import Permission
@@ -12,9 +16,11 @@ from app.db.models.user_role import UserRole
 
 __all__ = [
     "Document",
+    "DocumentProcessing",
     "EmailVerificationToken",
     "PasswordResetToken",
     "Permission",
+    "ProcessingLifecycleStatus",
     "RefreshToken",
     "Role",
     "RolePermission",

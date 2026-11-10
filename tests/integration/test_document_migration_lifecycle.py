@@ -63,7 +63,7 @@ async def test_migration_lifecycle_upgrade_downgrade_reupgrade() -> None:
 
         # 2. Test Alembic downgrade to 0010
         await close_engine()
-        await asyncio.to_thread(command.downgrade, cfg, "-1")
+        await asyncio.to_thread(command.downgrade, cfg, "0010_create_documents_table")
 
         # Verify column is gone in 0010
         engine2 = get_engine()

@@ -62,9 +62,24 @@ from app.services.password_reset import (
     invalidate_user_reset_tokens,
     request_password_reset,
 )
+from app.services.processing_lifecycle import (
+    DocumentNotFoundError as ProcessingDocumentNotFoundError,
+)
+from app.services.processing_lifecycle import (
+    DocumentPendingDeletionError,
+    InvalidProcessingTransitionError,
+    ProcessingAlreadyCompletedError,
+    ProcessingConcurrencyError,
+    ProcessingExecutionNotFoundError,
+    ProcessingLifecycleError,
+    ProcessingLifecycleService,
+    ProcessingTerminalStateError,
+    ProcessingValidationError,
+)
 
 __all__ = [
     "DefaultRoleNotFoundError",
+    "DocumentPendingDeletionError",
     "DocumentPersistenceError",
     "DocumentStorageError",
     "DocumentUploadError",
@@ -80,9 +95,18 @@ __all__ = [
     "InvalidCredentialsError",
     "InvalidFilenameError",
     "InvalidPasswordResetTokenError",
+    "InvalidProcessingTransitionError",
     "InvalidRefreshTokenError",
     "InvalidVerificationTokenError",
     "PasswordResetError",
+    "ProcessingAlreadyCompletedError",
+    "ProcessingConcurrencyError",
+    "ProcessingDocumentNotFoundError",
+    "ProcessingExecutionNotFoundError",
+    "ProcessingLifecycleError",
+    "ProcessingLifecycleService",
+    "ProcessingTerminalStateError",
+    "ProcessingValidationError",
     "UnsupportedFileTypeError",
     "UploadSizeExceededError",
     "UserAlreadyVerifiedError",

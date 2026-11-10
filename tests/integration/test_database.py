@@ -117,7 +117,7 @@ async def test_alembic_single_head_and_history() -> None:
     script = ScriptDirectory.from_config(alembic_cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0011_doc_deletion_pending_at"
+    assert heads[0] == "0014_doc_proc_terminal_immut"
 
 
 @pytest.mark.asyncio

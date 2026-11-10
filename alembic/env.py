@@ -25,7 +25,9 @@ target_metadata = Base.metadata
 
 # Override sqlalchemy.url using application settings if not explicitly passed
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+current_url = config.get_main_option("sqlalchemy.url")
+if not current_url or current_url == "postgresql+asyncpg://user:pass@localhost/dbname":
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 
 def run_migrations_offline() -> None:

@@ -257,10 +257,88 @@ Zero modifications to `BaseProcessor`, `ProcessingContext`, or `ProcessingResult
 
 ---
 
-## 7. Deferred Work
+## 7. Phase 4.2 — Processing Persistence Model & Lifecycle State Machine
+
+Phase 4.2 connects the independent processing domain to PostgreSQL persistence without introducing coupling to FastAPI, HTTP endpoints, or background-job infrastructure.
+
+### A. Persistence Model (`DocumentProcessing`)
+
+The `DocumentProcessing` entity (`app/db/models/document_processing.py`) maps to the `document_processings` table:
+
+| Column | Type | Constraints / Nullability | Description |
+|---|---|---|---|
+| `id` | UUID | PRIMARY KEY, NOT NULL | Unique processing execution identifier |
+| `document_id` | UUID | FOREIGN KEY -> `documents.id` ON DELETE CASCADE, NOT NULL | Target document |
+| `processor_name` | VARCHAR(64) | NOT NULL | Identifier of the processor engine |
+| `processor_version` | VARCHAR(32) | NOT NULL | Semantic version of the processor engine |
+| `status` | VARCHAR(20) | NOT NULL, DEFAULT `'pending'` | Current lifecycle status |
+| `input_sha256` | VARCHAR(64) | NOT NULL | Hex SHA-256 hash of input document content |
+| `result_schema_version` | VARCHAR(32) | NULL | Version string of the persisted result schema |
+| `result` | JSONB | NULL | Structured processing result dictionary |
+| `error_code` | VARCHAR(64) | NULL | Machine-readable failure classification code |
+| `error_message` | TEXT | NULL | Path-scrubbed diagnostic error or cancel reason |
+| `created_at` | TIMESTAMPTZ | NOT NULL, server_default=now() | Execution creation timestamp |
+| `started_at` | TIMESTAMPTZ | NULL | Timestamp when execution entered `running` |
+| `finished_at` | TIMESTAMPTZ | NULL | Timestamp when execution reached terminal state |
+| `updated_at` | TIMESTAMPTZ | NOT NULL, server_default=now() | Row last modification timestamp |
+
+### B. Database Constraints, Indexes & Invariant Enforcement
+
+1. **Check Constraints**:
+   - `ck_document_processings_status`: `status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')`
+   - `ck_document_processings_input_sha256`: `input_sha256 ~ '^[0-9a-f]{64}$'`
+   - `ck_document_processings_timestamps`: `started_at IS NULL OR finished_at IS NULL OR finished_at >= started_at`
+   - `ck_document_processings_status_fields` (updated in migration `0013_doc_proc_transitions`):
+     - `pending`: `started_at IS NULL AND finished_at IS NULL AND result IS NULL AND error_code IS NULL`
+     - `running`: `started_at IS NOT NULL AND finished_at IS NULL AND result IS NULL AND error_code IS NULL`
+     - `succeeded`: `started_at IS NOT NULL AND finished_at IS NOT NULL AND result IS NOT NULL AND result != 'null'::jsonb AND error_code IS NULL`
+     - `failed`: `started_at IS NOT NULL AND finished_at IS NOT NULL AND result IS NULL AND error_code IS NOT NULL`
+     - `cancelled`: `finished_at IS NOT NULL AND result IS NULL AND error_code IS NULL`
+2. **Database Trigger (`trg_document_processings_transitions`)**:
+   - Added via migration `0013_doc_proc_transitions` as a `BEFORE UPDATE` trigger on `document_processings`.
+   - Compares `OLD.status` vs `NEW.status` to enforce valid state transitions at the raw PostgreSQL layer.
+   - Strictly blocks ALL UPDATE operations on records in terminal states (`succeeded`, `failed`, `cancelled`), guaranteeing full column-level immutability (`status`, `result`, `error_code`, `error_message`, `started_at`, `finished_at`, `updated_at`, etc.) at the raw PostgreSQL layer.
+   - Prevents raw SQL resurrection or post-terminal mutation even if all row fields are modified concurrently.
+   - Rejects illegal non-terminal transitions (e.g. `pending -> succeeded` or `pending -> failed`).
+3. **Indexes**:
+   - `pk_document_processings`: Primary key on `id`
+   - `ix_document_processings_document_id_created_at`: Composite index for history pagination `(document_id, created_at)`
+   - `ix_document_processings_status_created_at`: For operational status monitoring `(status, created_at)`
+   - `ix_document_processings_document_id_status`: For filtering document runs by status `(document_id, status)`
+
+### C. State Machine & Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: create_execution()
+    pending --> running: start_execution()
+    pending --> cancelled: cancel_execution()
+    running --> succeeded: complete_execution()
+    running --> failed: fail_execution()
+    running --> cancelled: cancel_execution()
+    succeeded --> [*]: Terminal (Trigger-Enforced)
+    failed --> [*]: Terminal (Trigger-Enforced)
+    cancelled --> [*]: Terminal (Trigger-Enforced)
+```
+
+- **Terminal States**: `succeeded`, `failed`, `cancelled` are strictly immutable. Application-level methods raise `ProcessingAlreadyCompletedError`, and database trigger `trg_document_processings_transitions` blocks direct SQL updates with `check_violation`.
+- **Cancellation**: Idempotent for already-cancelled executions; valid from `pending` or `running`; rejected for `succeeded` or `failed`.
+- **Concurrency & Row Locking**:
+  - All transition operations (`start_execution`, `complete_execution`, `fail_execution`, `cancel_execution`) acquire a row-level exclusive lock via `SELECT ... FOR UPDATE` on `DocumentProcessing`, guaranteeing serializable atomic transitions without race conditions.
+  - `create_execution()` atomically acquires an exclusive row-level lock via `SELECT ... FOR UPDATE` on `Document` before checking `Document.deletion_pending_at` and inserting the execution record in the same transaction.
+
+### D. Document Deletion Integration & Race Prevention
+
+- **Atomic Deletion Lock**: Because `create_execution()` and `mark_pending_deletion()` both acquire `SELECT ... FOR UPDATE` on the parent `Document` row, concurrent creation vs deletion races are strictly serialized by PostgreSQL row locks:
+  - **Scenario A (Creation wins lock)**: `create_execution` finds `deletion_pending_at IS NULL`, inserts `pending` execution, commits. Deletion then acquires the lock and marks document pending deletion.
+  - **Scenario B (Deletion wins lock)**: Deletion acquires lock, sets `deletion_pending_at`, commits. `create_execution` acquires lock, discovers `deletion_pending_at IS NOT NULL`, rolls back and raises `DocumentPendingDeletionError`.
+- **Physical Cascade**: Foreign key constraint `ON DELETE CASCADE` and SQLAlchemy `passive_deletes=True` ensure that hard deletion of a document row cleanly cascades in PostgreSQL to remove all associated `document_processings` records.
+
+---
+
+## 8. Deferred Work
 
 The following capabilities are intentionally deferred to subsequent roadmap phases:
-- **Phase 4.2**: Document processing metadata persistence (PostgreSQL processing tables and state machine).
 - **Phase 4.3**: PDF text extraction and metadata processing engine.
 - **Phase 4.4**: Image processing and metadata extraction engine.
 - **Phase 4.5**: Processing orchestration service and API endpoints.

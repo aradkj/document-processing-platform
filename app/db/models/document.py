@@ -10,6 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.db.models.document_processing import DocumentProcessing
     from app.db.models.user import User
 
 
@@ -79,6 +80,13 @@ class Document(Base):
     user: Mapped["User"] = relationship(
         "User",
         back_populates="documents",
+        lazy="raise",
+    )
+    processing_runs: Mapped[list["DocumentProcessing"]] = relationship(
+        "DocumentProcessing",
+        back_populates="document",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
         lazy="raise",
     )
 
